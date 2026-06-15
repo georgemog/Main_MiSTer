@@ -5886,7 +5886,7 @@ void HandleUI(void)
 
 	case MENU_MINIMIG_CHIPSET1:
 		helptext_idx = HELPTEXT_CHIPSET;
-		menumask = 0x3FF;
+		menumask = 0x7FF;
 		OsdSetTitle("System");
 		parentstate = menustate;
 
@@ -5932,8 +5932,13 @@ void HandleUI(void)
 		strcat(s, (minimig_config.memory & 0x40) ? "enabled " : "disabled");
 		OsdWrite(m++, s, menusub == 8, 0);
 
+		OsdWrite(m++, "", 0, 0);
+		strcpy(s, " Ethernet : ");
+		strcat(s, a2065_iface_msg(a2065_get_iface()));
+		OsdWrite(m++, s, menusub == 9, 0);
+
 		for (int i = m; i < OsdGetSize() - 1; i++) OsdWrite(i, "", 0, 0);
-		OsdWrite(OsdGetSize() - 1, STD_BACK, menusub == 9, 0);
+		OsdWrite(OsdGetSize() - 1, STD_BACK, menusub == 10, 0);
 
 		menustate = MENU_MINIMIG_CHIPSET2;
 		break;
@@ -6064,6 +6069,14 @@ void HandleUI(void)
 				menustate = MENU_MINIMIG_CHIPSET1;
 			}
 			else if (menusub == 9)
+			{
+				int m2 = a2065_get_iface();
+				if (minus) m2 = (m2 + 2) % 3; // OFF <- eth0 <- eth1
+				else       m2 = (m2 + 1) % 3; // OFF -> eth0 -> eth1
+				a2065_set_iface(m2);
+				menustate = MENU_MINIMIG_CHIPSET1;
+			}
+			else if (menusub == 10)
 			{
 				menustate = MENU_MINIMIG_MAIN1;
 				menusub = 6;
