@@ -19,6 +19,7 @@
 #include "spi.h"
 #include "cfg.h"
 #include "input.h"
+#include "support/ne2000/ne2000.h"
 #include "fpga_io.h"
 #include "file_io.h"
 #include "menu.h"
@@ -1511,6 +1512,7 @@ void user_io_init(const char *path, const char *xml)
 				{
 					x86_config_load();
 					x86_init();
+					ne2000_init();
 				}
 				else if (is_archie())
 				{
@@ -2938,6 +2940,7 @@ void user_io_send_buttons(char force)
 			if (is_pce()) pcecd_reset();
 			if (is_saturn()) saturn_reset();
 			if (is_x86() || is_pcxt()) x86_init();
+			if (is_x86()) ne2000_init();
 			if (is_uneon()) x86_ide_set();
 			if (is_st()) tos_reset(0);
 			ResetUART();
@@ -3066,6 +3069,7 @@ void user_io_poll()
 	if (is_x86() || is_pcxt())
 	{
 		x86_poll(0);
+		if (is_x86()) ne2000_poll();
 	}
 	else if ((core_type == CORE_TYPE_8BIT) && !is_menu() && !is_minimig())
 	{

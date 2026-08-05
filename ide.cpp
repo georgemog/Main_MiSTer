@@ -574,6 +574,22 @@ void ide_img_set(uint32_t drvnum, fileTYPE *f, int cd, int sectors, int heads, i
 			0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
 			0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 		};
+
+		// Give the drive a real model + firmware string. Win95 keys its
+		// protected-mode IDE driver (ESDI_506.PDR) binding off the model; a blank
+		// model (as this table shipped) leaves Drive C in MS-DOS Compatibility
+		// Mode (slow, synchronous, CPU-blocking disk I/O). ATA strings are
+		// big-endian within each 16-bit word.
+		{
+			char model[40], fw[8];
+			memset(model, ' ', sizeof model);
+			memset(fw, ' ', sizeof fw);
+			memcpy(model, "MiSTer ao486 Hard Disk", 22);
+			memcpy(fw, "1.0", 3);
+			for (int i = 0; i < 20; i++) identify[27 + i] = ((uint8_t)model[2*i] << 8) | (uint8_t)model[2*i+1];
+			for (int i = 0; i < 4;  i++) identify[23 + i] = ((uint8_t)fw[2*i] << 8) | (uint8_t)fw[2*i+1];
+		}
+
 		for (int i = 0; i < 256; i++) drive->id[i] = identify[i];
 	}
 	else

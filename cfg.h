@@ -101,6 +101,9 @@ typedef struct {
 	uint8_t lookahead;
 	char main[1024];
 	char vfilter_interlace_default[1023];
+	uint8_t ne2000;                 // ao486 NE2000 network bridge enable
+	char ne2000_iface[16];          // host interface to bridge (default eth0)
+	uint32_t ne2000_rxrate;         // RX delivery cap in Mbit/s (0 = unlimited)
 } cfg_t;
 
 extern cfg_t cfg;
