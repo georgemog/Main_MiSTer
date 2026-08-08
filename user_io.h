@@ -270,6 +270,7 @@ char is_minimig();
 char is_sharpmz();
 char is_menu();
 char is_x86();
+char is_z386();
 char is_snes();
 char is_sgb();
 char is_neogeo();

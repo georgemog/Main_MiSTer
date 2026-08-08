@@ -214,6 +214,58 @@ char is_x86()
 	return (is_x86_type == 1);
 }
 
+// z386 (nand2mario/z386_MiSTer): separate from is_x86() deliberately, so the
+// existing AO486 path is untouched. Same NE2000 DDR-mailbox ABI/window
+// (0x1FF00000), ported to z386 in NE2000_Z386_PORT_PLAN.md, Phase 1.
+static int is_z386_type = 0;
+char is_z386()
+{
+	if (!is_z386_type) is_z386_type = strcasecmp(orig_name, "Z386") ? 2 : 1;
+	return (is_z386_type == 1);
+}
+
+// One-shot Phase 1.4 hardware gate: triggers ne2000_hps_ext_selftest.v (a
+// temporary bring-up generator standing in for ne2000_core.v -- see
+// NE2000_Z386_PORT_PLAN.md) over the z386 management bus at 0xF6xx, using
+// exactly ide.cpp's ide_reg_set/ide_recvbuf primitives (same UIO_DMA_WRITE/
+// UIO_DMA_READ protocol, same 4-word cmd+addr+pad+data framing). Proves the
+// DDR-mailbox+arbiter round-trips on real silicon without needing a guest
+// OS or ne2000_core.v wired in yet. Logged, not gating anything -- delete
+// once Phase 2 replaces the selftest generator with the real core.
+static void ne2000_z386_selftest()
+{
+	EnableIO();
+	spi8(UIO_DMA_WRITE);
+	spi32_w(0xF600);   // TRIGGER
+	spi_w(0);
+	DisableIO();
+
+	uint16_t result = 0;
+	for (int i = 0; i < 1000; i++)
+	{
+		EnableIO();
+		fpga_spi_fast(UIO_DMA_READ);
+		fpga_spi_fast(0xF601);   // RESULT
+		fpga_spi_fast(0);
+		fpga_spi_fast_block_read(&result, 1);
+		DisableIO();
+		if (result & 0x02) break;   // DONE
+		usleep(1000);
+	}
+
+	uint16_t rdata = 0;
+	EnableIO();
+	fpga_spi_fast(UIO_DMA_READ);
+	fpga_spi_fast(0xF602);   // RDATA
+	fpga_spi_fast(0);
+	fpga_spi_fast_block_read(&rdata, 1);
+	DisableIO();
+
+	printf("[ne2000] z386 Phase 1.4 selftest: result=%04X rdata=%04X -- %s\n",
+	       result, rdata, (result & 0x04) ? "PASS" : "FAIL");
+	fflush(stdout);
+}
+
 static int is_snes_type = 0;
 char is_snes()
 {
@@ -1513,6 +1565,13 @@ void user_io_init(const char *path, const char *xml)
 					x86_config_load();
 					x86_init();
 					ne2000_init();
+				}
+				else if (is_z386())
+				{
+					// z386 has its own boot/config flow, not x86.cpp's --
+					// only the NE2000 bridge is shared with ao486 here.
+					ne2000_init();
+					ne2000_z386_selftest();
 				}
 				else if (is_archie())
 				{
@@ -2941,6 +3000,7 @@ void user_io_send_buttons(char force)
 			if (is_saturn()) saturn_reset();
 			if (is_x86() || is_pcxt()) x86_init();
 			if (is_x86()) ne2000_init();
+			if (is_z386()) { ne2000_init(); ne2000_z386_selftest(); }
 			if (is_uneon()) x86_ide_set();
 			if (is_st()) tos_reset(0);
 			ResetUART();
@@ -3064,6 +3124,11 @@ void user_io_poll()
 	{
 		check_status_change();
 	}
+
+	// z386 (NE2000_Z386_PORT_PLAN.md): standalone check ahead of the is_x86()
+	// chain below, deliberately not folded into it -- z386 isn't ao486/pcxt
+	// and shouldn't pick up x86_poll(). This only needs ne2000_poll().
+	if (is_z386()) ne2000_poll();
 
 	// sd card emulation
 	if (is_x86() || is_pcxt())
