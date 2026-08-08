@@ -21,6 +21,9 @@
 #include "file_io.h"
 #include "hardware.h"
 #include "ide.h"
+#include "ide_cdrom.h"
+#include "support/minimig/akiko_cd32.h"
+#include "support/minimig/cdtv_cd.h"
 
 #if 0
 	#define dbg_printf     printf
@@ -79,6 +82,28 @@ const uint32_t ide_io_max_size = 32;
 uint8_t ide_buf[ide_io_max_size * 512];
 
 ide_config ide_inst[2] = {};
+
+drive_t cd32_drive = {};
+drive_t cdtv_drive = {};
+
+int cd_drive_open(int slot, const char *filename)
+{
+	static fileTYPE cd_drive_file[2] = {};
+
+	drive_t *drv = slot ? &cdtv_drive : &cd32_drive;
+	drv->cd = 1;
+
+	const char *res = cd_drive_parse(drv, slot, filename);
+
+	int present = res ? ide_img_mount(&cd_drive_file[slot], res, 0) : 0;
+	drv->f = present ? &cd_drive_file[slot] : NULL;
+
+	const char *full = present ? res : "";
+	if (slot) cdtv_cd_set_cd_path(full);
+	else akiko_cd32_set_cd_path(full);
+
+	return present;
+}
 
 uint16_t ide_check()
 {
@@ -160,7 +185,11 @@ void ide_get_regs(ide_config *ide)
 
 void ide_set_regs(ide_config *ide)
 {
-	if (!(ide->regs.status & (ATA_STATUS_BSY | ATA_STATUS_ERR))) ide->regs.status |= ATA_STATUS_DSC;
+	// Auto-assert DSC for non-CD drives only; let each ATAPI command set its own status.
+	if (!ide->drive[ide->regs.drv].cd && !(ide->regs.status & (ATA_STATUS_BSY | ATA_STATUS_ERR)))
+	{
+		ide->regs.status |= ATA_STATUS_DSC;
+	}
 
 	uint8_t data[12] =
 	{
@@ -958,7 +987,24 @@ static int handle_hdd(ide_config *ide)
 
 	case 0x40: // READ VERIFY
 		dbg_printf("Received read verify command. Not implemented but returning OK.\n");
-		ide->regs.status = ATA_STATUS_RDY | ATA_STATUS_IRQ;
+		ide->regs.error = 0;
+		ide->regs.status = ATA_STATUS_RDY | ATA_STATUS_DSC | ATA_STATUS_IRQ;
+		ide_set_regs(ide);
+		break;
+
+	case 0x70: // seek
+	case 0xE3: // standby immediate
+		// These no-data commands complete immediately for image-backed disks.
+		ide->regs.error = 0;
+		ide->regs.status = ATA_STATUS_RDY | ATA_STATUS_DSC | ATA_STATUS_IRQ;
+		ide_set_regs(ide);
+		break;
+
+	case 0x90: // execute device diagnostic
+		// Return the ATA drive-0-passed diagnostic code. Some system BIOSes
+		// require this command to succeed before registering the disk.
+		ide->regs.error = 0x01;
+		ide->regs.status = ATA_STATUS_RDY | ATA_STATUS_DSC | ATA_STATUS_IRQ;
 		ide_set_regs(ide);
 		break;
 
@@ -1025,7 +1071,8 @@ void ide_io(int num, int req)
 		else if (ide->state == IDE_STATE_WAIT_PKT_RD)
 		{
 			if (ide->regs.pkt_cnt) cdrom_read(ide);
-			else cdrom_reply(ide, 0);
+			// A successful data-phase completion must report GOOD, not UNIT ATTENTION.
+			else cdrom_reply(ide, 0, 0, 0, false);
 		}
 		else if (ide->state == IDE_STATE_WAIT_PKT_MODE)
 		{
@@ -1058,7 +1105,8 @@ void ide_io(int num, int req)
 
 		ide_get_regs(ide);
 		ide->regs.head = 0;
-		ide->regs.error = 0;
+		// ATAPI posts diagnostic code 01h after a bus reset; an ATA HDD posts 0.
+		ide->regs.error = ide->drive[ide->regs.drv].cd ? 1 : 0;
 		ide->regs.sector = 1;
 		ide->regs.sector_count = 1;
 		ide->regs.cylinder = (!ide->drive[ide->regs.drv].present) ? 0xFFFF : ide->drive[ide->regs.drv].cd ? 0xEB14 : 0x0000;
@@ -1109,7 +1157,8 @@ int ide_open(uint8_t unit, const char* filename)
 	static fileTYPE hdd_file[4] = {};
 	chs_t chs = {};
 
-	if (!is_minimig() || ((minimig_config.ide_cfg & 1) && minimig_config.hardfile[unit].cfg))
+	if (!is_minimig()
+	    || ((minimig_config.ide_cfg & 1) && minimig_config.hardfile[unit].cfg))
 	{
 		printf("\nChecking HDD %d\n", unit);
 		if (filename[0] && FileOpenEx(&hdd_file[unit], filename, FileCanWrite(filename) ? O_RDWR : O_RDONLY))
@@ -1145,6 +1194,11 @@ int ide_open(uint8_t unit, const char* filename)
 	}
 
 	// close if opened earlier.
+	{
+		int port = (unit >> 1) & 1;
+		int drv  = unit & 1;
+		cdrom_close_chd(&ide_inst[port].drive[drv]);
+	}
 	ide_img_set(unit, 0, 0);
 	FileClose(&hdd_file[unit]);
 	return 0;

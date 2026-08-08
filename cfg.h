@@ -19,6 +19,12 @@ typedef struct {
 	uint8_t hdmi_audio_96k;
 	uint8_t dvi_mode;
 	uint8_t hdmi_limited;
+	uint8_t hdmi_cec;
+	uint8_t hdmi_cec_sleep;
+	uint8_t hdmi_cec_wake;
+	uint8_t hdmi_cec_input_mode;
+	uint8_t hdmi_cec_power_on;
+	float hdmi_cec_clock;
 	uint8_t direct_video;
 	uint8_t video_info;
 	float refresh_min;
@@ -78,10 +84,9 @@ typedef struct {
 	uint16_t wheel_range;
 	uint8_t hdmi_game_mode;
 	uint8_t vrr_mode;
-	uint8_t vrr_min_framerate;
-	uint8_t vrr_max_framerate;
 	uint8_t vrr_vesa_framerate;
 	uint16_t video_off;
+	uint8_t video_off_logo;
 	uint8_t disable_autofire;
 	uint8_t video_brightness;
 	uint8_t video_contrast;
@@ -104,6 +109,13 @@ typedef struct {
 	uint8_t ne2000;                 // ao486 NE2000 network bridge enable
 	char ne2000_iface[16];          // host interface to bridge (default eth0)
 	uint32_t ne2000_rxrate;         // RX delivery cap in Mbit/s (0 = unlimited)
+	char autofire_rates[3072];
+	uint8_t autofire_on_directions;
+	char screenshot_image_format[16];
+	uint16_t xbe2_shift;
+	uint8_t spd_quirk;
+	uint16_t hdmi_off;
+	uint32_t keyboard_as_joystick[256];
 } cfg_t;
 
 extern cfg_t cfg;

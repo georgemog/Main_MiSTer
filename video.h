@@ -15,6 +15,7 @@ struct VideoInfo
 	uint32_t ptime;
 	uint32_t ctime;
 	uint32_t vtimeh;
+	uint32_t frame_clocks;
 	uint32_t arx;
 	uint32_t ary;
 	uint32_t arxy;
@@ -30,14 +31,19 @@ struct VideoInfo
 	bool rotated;
 };
 
+// expose video timings for timerfd-based frame timer
+extern VideoInfo current_video_info;
+
 void  video_init();
+void  video_poll();
+
+int   video_get_edid(uint8_t **buf, int *size);
+void  video_hdmi_power(int on);
 
 int   video_get_scaler_flt(int type);
 void  video_set_scaler_flt(int type, int n);
 char* video_get_scaler_coeff(int type, int only_name = 1);
 void  video_set_scaler_coeff(int type, const char *name);
-
-
 
 int   video_get_gamma_en();
 void  video_set_gamma_en(int n);
@@ -54,7 +60,7 @@ int   video_get_rotated();
 
 void video_cfg_reset();
 
-void  video_mode_adjust();
+void  video_mode_adjust(bool force = false);
 
 int   hasAPI1_5();
 
@@ -64,9 +70,12 @@ void video_menu_bg(int n, int idle = 0);
 int video_bg_has_picture();
 int video_chvt(int num);
 void video_cmd(char *cmd);
+void video_mode_cmd(char *cmd);
 
 void video_core_description(char *str, size_t len);
 void video_scaler_description(char *str, size_t len);
 char* video_get_core_mode_name(int with_vrefresh = 1);
+
+void dbg_draw_cursor(int x, int y);
 
 #endif // VIDEO_H
