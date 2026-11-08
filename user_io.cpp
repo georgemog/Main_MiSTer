@@ -1489,8 +1489,9 @@ void user_io_init(const char *path, const char *xml)
 	// path below restarts them if the card is enabled.
 	a2065_stop();
 
-	// Same for the NeXT ethernet bridge.
+	// Same for the NeXT ethernet bridge and the NeXT-Color's DSP56001.
 	next_enet_stop();
+	next_dsp_stop();
 	sun_enet_stop();
 	hp9k_enet_stop();
 
@@ -1644,6 +1645,8 @@ void user_io_init(const char *path, const char *xml)
 				// a branch of the chain below, or the core skips the boot
 				// ROM load at its end and comes up with no ROM at all.
 				if (is_next()) next_enet_start();
+				// the DSP56001 on the ARM (NeXT-Color cores with the DSP link)
+				if (is_next()) next_dsp_start();
 				// before the boot ROMs: the Sun-2's ID PROM goes in while it is held in reset
 				if (is_sun_family()) sun_enet_start();
 				if (is_hp9k_family()) hp9k_enet_start();
