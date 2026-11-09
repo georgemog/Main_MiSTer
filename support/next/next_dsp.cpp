@@ -258,6 +258,10 @@ static void tx_feed(void)
 	}
 }
 
+// the ISR byte service() last saw: while it is unchanged and nothing is
+// queued, parked or pending, service() would do nothing (link_busy)
+static int isr_seen = -1;
+
 // what the DSP did to its side of the port, after each instruction
 static void service(void)
 {
@@ -329,6 +333,16 @@ static void service(void)
 		hc_state = HC_NONE;
 		d2h(R_HCACK, 0);
 	}
+	isr_seen = isr();
+}
+
+// service() has work: host words queued, a command parked or in its
+// handler, a post-command hold, or the DSP changed the host port's ISR
+// (RXDF from HTX, HF2/HF3 from HCR, TXDE as it reads HRX).  Anything the
+// FPGA sends comes through h2d_poll, which link_step follows with service().
+static inline int link_busy(void)
+{
+	return txq_n || parked || hc_state != HC_NONE || hc_hold_left || isr() != isr_seen;
 }
 
 // hooks from the core (next_dsp_shim.h)
@@ -596,7 +610,7 @@ static int link_step(int n)
 		step_cycles += dsp_core.instr_cycle;
 		done++;
 		instrs++;
-		service();
+		if (link_busy()) service();
 		if (slice_break) break;
 	}
 

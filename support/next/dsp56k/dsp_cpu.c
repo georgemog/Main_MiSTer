@@ -212,9 +212,9 @@ static void dsp_compute_ssh_ssl(void);
 
 static void opcode8h_0(void);
 
-static void dsp_update_rn(uint32_t numreg, uint32_t reg_value, int16_t reg_mofifier, uint16_t reg_modulo);
+static inline void dsp_update_rn(uint32_t numreg, uint32_t reg_value, int16_t reg_mofifier, uint16_t reg_modulo);
 static void dsp_update_rn_bitreverse(uint32_t numreg, uint32_t reg_value, int16_t reg_mofifier);
-static void dsp_update_rn_modulo(uint32_t numreg, uint32_t reg_value, int16_t reg_mofifier, uint16_t reg_modulo);
+static inline void dsp_update_rn_modulo(uint32_t numreg, uint32_t reg_value, int16_t reg_mofifier, uint16_t reg_modulo);
 static int dsp_calc_ea(uint32_t ea_mode, uint32_t *dst_addr);
 static int dsp_calc_cc(uint32_t cc_code);
 
@@ -1233,54 +1233,55 @@ static void dsp_postexecute_interrupts(void)
 
 static void dsp_ccr_update_e_u_n_z(uint32_t reg0, uint32_t reg1, uint32_t reg2)
 {
+	/* NeXT-Color soft DSP: SR built in a local, written once */
 	uint32_t scaling, value_e, value_u;
+	uint32_t sr = dsp_core.registers[DSP_REG_SR] & (BITMASK(16)-((1<<DSP_SR_E) | (1<<DSP_SR_U) | (1<<DSP_SR_N) | (1<<DSP_SR_Z)));
 
-	/* Initialize SR register */
-	dsp_core.registers[DSP_REG_SR] &= BITMASK(16)-((1<<DSP_SR_E) | (1<<DSP_SR_U) | (1<<DSP_SR_N) | (1<<DSP_SR_Z));
-
-	scaling = (dsp_core.registers[DSP_REG_SR]>>DSP_SR_S0) & BITMASK(2);
+	scaling = (sr>>DSP_SR_S0) & BITMASK(2);
 	switch(scaling) {
 		case 0:
 			/* Extension Bit (E) */
 			value_e = (reg0<<1) + (reg1>>23);
 			if ((value_e != 0) && (value_e != BITMASK(9)))
-				dsp_core.registers[DSP_REG_SR] |= 1 << DSP_SR_E;
+				sr |= 1 << DSP_SR_E;
 
 			/* Unnormalized bit (U) */
 			if ((reg1 & 0xc00000) == 0 || (reg1 & 0xc00000) == 0xc00000)
-				dsp_core.registers[DSP_REG_SR] |= 1 << DSP_SR_U;
+				sr |= 1 << DSP_SR_U;
 			break;
 		case 1:
 			/* Extension Bit (E) */
 			if ((reg0 != 0) && (reg0 != BITMASK(8)))
-				dsp_core.registers[DSP_REG_SR] |= 1 << DSP_SR_E;
+				sr |= 1 << DSP_SR_E;
 
 			/* Unnormalized bit (U) */
 			value_u = ((reg0<<1) + (reg1>>23)) & 3;
 			if (value_u == 0 || value_u == 3)
-				dsp_core.registers[DSP_REG_SR] |= 1 << DSP_SR_U;
+				sr |= 1 << DSP_SR_U;
 			break;
 		case 2:
 			/* Extension Bit (E) */
 			value_e = (reg0<<2) + (reg1>>22);
 			if ((value_e != 0) && (value_e != BITMASK(10)))
-				dsp_core.registers[DSP_REG_SR] |= 1 << DSP_SR_E;
+				sr |= 1 << DSP_SR_E;
 
 			/* Unnormalized bit (U) */
 			if ((reg1 & 0x600000) == 0 || (reg1 & 0x600000) == 0x600000)
-				dsp_core.registers[DSP_REG_SR] |= 1 << DSP_SR_U;
+				sr |= 1 << DSP_SR_U;
 			break;
 		default:
+			dsp_core.registers[DSP_REG_SR] = sr;
 			return;
-			break;
 	}
 
 	/* Zero Flag (Z) */
 	if ((reg1 == 0) && (reg2 == 0) && (reg0 == 0))
-		dsp_core.registers[DSP_REG_SR] |= 1 << DSP_SR_Z;
+		sr |= 1 << DSP_SR_Z;
 
 	/* Negative Flag (N) */
-	dsp_core.registers[DSP_REG_SR] |= (reg0>>4) & 0x8;
+	sr |= (reg0>>4) & 0x8;
+
+	dsp_core.registers[DSP_REG_SR] = sr;
 }
 
 /**********************************
@@ -1732,7 +1733,7 @@ static void dsp_compute_ssh_ssl(void)
  *	Effective address calculation
  **********************************/
 
-static void dsp_update_rn(uint32_t numreg, uint32_t reg_value, int16_t reg_mofifier, uint16_t reg_modulo)
+static inline void dsp_update_rn(uint32_t numreg, uint32_t reg_value, int16_t reg_mofifier, uint16_t reg_modulo)
 {
 	uint32_t value;
 
@@ -1796,31 +1797,22 @@ static void dsp_update_rn_bitreverse(uint32_t numreg, uint32_t reg_value, int16_
 	dsp_core.registers[DSP_REG_R0+numreg] = value;
 }
 
-static void dsp_update_rn_modulo(uint32_t numreg, uint32_t reg_value, int16_t reg_mofifier, uint16_t reg_modulo)
+/* NeXT-Color soft DSP: the buffer size from clz instead of a loop */
+static inline void dsp_update_rn_modulo(uint32_t numreg, uint32_t reg_value, int16_t reg_mofifier, uint16_t reg_modulo)
 {
-	uint16_t bufsize, bufmask, modulo, abs_modifier;
+	uint16_t bufmask, modulo, abs_modifier;
 	uint32_t r_reg, lobound, hibound;
 
 	r_reg = reg_value|0x10000;
 	modulo = reg_modulo+1;
 
-	bufsize = 1;
-	while (bufsize < modulo) {
-		bufsize <<= 1;
-	}
-	bufmask = bufsize - 1;
-
+	/* the buffer is the next power of two >= modulo (reg_modulo is 1..32767 here) */
+	bufmask = reg_modulo ? (uint16_t)((1u << (32 - __builtin_clz(reg_modulo))) - 1) : 0;
 
 	lobound = r_reg - (r_reg&bufmask);
 	hibound = lobound + modulo - 1;
 
-
-	if (reg_mofifier<0) {
-		abs_modifier = -reg_mofifier;
-	} else {
-		abs_modifier = reg_mofifier;
-	}
-
+	abs_modifier = reg_mofifier < 0 ? -reg_mofifier : reg_mofifier;
 
 	if (abs_modifier&bufmask) {
 		if (abs_modifier>modulo) {
@@ -1855,23 +1847,20 @@ static int dsp_calc_ea(uint32_t ea_mode, uint32_t *dst_addr)
 	   before using the new value of R, N or M as an address pointer
 	*/
 
-	/* Registers R0 -> R7 */
-	if (dsp_core.agu_pipeline_reg[0] == DSP_REG_R0+numreg)
-		reg_r = dsp_core.agu_pipeline_val[0];
-	else
-		reg_r = dsp_core.registers[DSP_REG_R0+numreg];
-
-	/* Registers N0 -> N7 */
-	if (dsp_core.agu_pipeline_reg[0] == DSP_REG_N0+numreg)
-		reg_n = dsp_core.agu_pipeline_val[0];
-	else
-		reg_n = dsp_core.registers[DSP_REG_N0+numreg];
-
-	/* Registers M0 -> M7 */
-	if (dsp_core.agu_pipeline_reg[0] == DSP_REG_M0+numreg)
-		reg_m = dsp_core.agu_pipeline_val[0];
-	else
-		reg_m = dsp_core.registers[DSP_REG_M0+numreg];
+	/* Registers R0 -> R7, N0 -> N7, M0 -> M7 (NeXT-Color soft DSP: the
+	   pipeline compare only when a move is pending; it names one register) */
+	reg_r = dsp_core.registers[DSP_REG_R0+numreg];
+	reg_n = dsp_core.registers[DSP_REG_N0+numreg];
+	reg_m = dsp_core.registers[DSP_REG_M0+numreg];
+	if (dsp_core.agu_pipeline_reg[0] != 0) {
+		uint32_t pr = dsp_core.agu_pipeline_reg[0];
+		if (pr == DSP_REG_R0+numreg)
+			reg_r = dsp_core.agu_pipeline_val[0];
+		else if (pr == DSP_REG_N0+numreg)
+			reg_n = dsp_core.agu_pipeline_val[0];
+		else if (pr == DSP_REG_M0+numreg)
+			reg_m = dsp_core.agu_pipeline_val[0];
+	}
 
 
 	switch (value) {
@@ -4333,120 +4322,47 @@ static uint16_t dsp_asr56(uint32_t *dest)
 	return (carry<<DSP_SR_C);
 }
 
+/* NeXT-Color soft DSP: 56-bit accumulator arithmetic on 64-bit integers
+   (bit-identical to Hatari's 24-bit-piece versions for masked operands) */
+#define ACC56_MASK 0x00ffffffffffffffULL
+static inline uint64_t acc56_pack(const uint32_t *v)
+{
+	return ((uint64_t)(v[0] & 0xff) << 48) | ((uint64_t)(v[1] & 0xffffff) << 24) | (v[2] & 0xffffff);
+}
+static inline void acc56_unpack(uint64_t r, uint32_t *v)
+{
+	v[0] = (uint32_t)(r >> 48) & 0xff;
+	v[1] = (uint32_t)(r >> 24) & 0xffffff;
+	v[2] = (uint32_t)r & 0xffffff;
+}
 static uint16_t dsp_add56(uint32_t *source, uint32_t *dest)
 {
-	uint16_t overflow, carry, flg_s, flg_d, flg_r;
-
-	flg_s = (source[0]>>7) & 1;
-	flg_d = (dest[0]>>7) & 1;
-
-	/* Add source to dest: D = D+S */
-	dest[2] += source[2];
-	dest[1] += source[1]+((dest[2]>>24) & 1);
-	dest[0] += source[0]+((dest[1]>>24) & 1);
-
-	carry = (dest[0]>>8) & 1;
-
-	dest[2] &= BITMASK(24);
-	dest[1] &= BITMASK(24);
-	dest[0] &= BITMASK(8);
-
-	flg_r = (dest[0]>>7) & 1;
-
-	/*set overflow*/
-	overflow = (flg_s ^ flg_r) & (flg_d ^ flg_r);
-
+	uint64_t s = acc56_pack(source), d = acc56_pack(dest), r = d + s;
+	uint16_t carry = (r >> 56) & 1;
+	uint16_t flg_s = (s >> 55) & 1, flg_d = (d >> 55) & 1, flg_r = (r >> 55) & 1;
+	uint16_t overflow = (flg_s ^ flg_r) & (flg_d ^ flg_r);
+	acc56_unpack(r, dest);
 	return (overflow<<DSP_SR_L)|(overflow<<DSP_SR_V)|(carry<<DSP_SR_C);
 }
-
 static uint16_t dsp_sub56(uint32_t *source, uint32_t *dest)
 {
-	uint16_t overflow, carry, flg_s, flg_d, flg_r, dest_save;
-
-	dest_save = dest[0];
-
-	/* Subtract source from dest: D = D-S */
-	dest[2] -= source[2];
-	dest[1] -= source[1]+((dest[2]>>24) & 1);
-	dest[0] -= source[0]+((dest[1]>>24) & 1);
-
-	carry = (dest[0]>>8) & 1;
-
-	dest[2] &= BITMASK(24);
-	dest[1] &= BITMASK(24);
-	dest[0] &= BITMASK(8);
-
-	flg_s = (source[0]>>7) & 1;
-	flg_d = (dest_save>>7) & 1;
-	flg_r = (dest[0]>>7) & 1;
-
-	/* set overflow */
-	overflow = (flg_s ^ flg_d) & (flg_r ^ flg_d);
-
+	uint64_t s = acc56_pack(source), d = acc56_pack(dest), r = d - s;
+	uint16_t carry = (r >> 56) & 1;
+	uint16_t flg_s = (s >> 55) & 1, flg_d = (d >> 55) & 1, flg_r = (r >> 55) & 1;
+	uint16_t overflow = (flg_s ^ flg_d) & (flg_r ^ flg_d);
+	acc56_unpack(r, dest);
 	return (overflow<<DSP_SR_L)|(overflow<<DSP_SR_V)|(carry<<DSP_SR_C);
 }
-
 static void dsp_mul56(uint32_t source1, uint32_t source2, uint32_t *dest, uint8_t signe)
 {
-	uint32_t part[4], zerodest[3], value;
-
-	/* Multiply: D = S1*S2 */
-	if (source1 & (1<<23)) {
-		signe ^= 1;
-		source1 = (1<<24) - source1;
-	}
-	if (source2 & (1<<23)) {
-		signe ^= 1;
-		source2 = (1<<24) - source2;
-	}
-
-	/* bits 0-11 * bits 0-11 */
-	part[0]=(source1 & BITMASK(12))*(source2 & BITMASK(12));
-	/* bits 12-23 * bits 0-11 */
-	part[1]=((source1>>12) & BITMASK(12))*(source2 & BITMASK(12));
-	/* bits 0-11 * bits 12-23 */
-	part[2]=(source1 & BITMASK(12))*((source2>>12)  & BITMASK(12));
-	/* bits 12-23 * bits 12-23 */
-	part[3]=((source1>>12) & BITMASK(12))*((source2>>12) & BITMASK(12));
-
-	/* Calc dest 2 */
-	dest[2] = part[0];
-	dest[2] += (part[1] & BITMASK(12)) << 12;
-	dest[2] += (part[2] & BITMASK(12)) << 12;
-
-	/* Calc dest 1 */
-	dest[1] = (part[1]>>12) & BITMASK(12);
-	dest[1] += (part[2]>>12) & BITMASK(12);
-	dest[1] += part[3];
-
-	/* Calc dest 0 */
-	dest[0] = 0;
-
-	/* Add carries */
-	value = (dest[2]>>24) & BITMASK(8);
-	if (value) {
-		dest[1] += value;
-		dest[2] &= BITMASK(24);
-	}
-	value = (dest[1]>>24) & BITMASK(8);
-	if (value) {
-		dest[0] += value;
-		dest[1] &= BITMASK(24);
-	}
-
-	/* Get rid of extra sign bit */
-	dsp_asl56(dest);
-
-	if (signe) {
-		zerodest[0] = zerodest[1] = zerodest[2] = 0;
-
-		dsp_sub56(dest, zerodest);
-
-		dest[0] = zerodest[0];
-		dest[1] = zerodest[1];
-		dest[2] = zerodest[2];
-	}
+	int64_t p = (int64_t)((int32_t)(source1 << 8) >> 8) * ((int32_t)(source2 << 8) >> 8);
+	p *= 2;
+	if (signe) p = -p;
+	acc56_unpack((uint64_t)p & ACC56_MASK, dest);
 }
+
+
+
 
 static void dsp_rnd56(uint32_t *dest)
 {
