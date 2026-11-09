@@ -77,9 +77,36 @@ enum { T_TX = 1, T_ICR, T_CVR, T_RXACK, T_RESET, T_START, T_MEM, T_IRQB };
 enum { R_RX = 1, R_HRXACK, R_FLAGS, R_HCACK, R_TXD, R_HIRESET };
 
 #define DSPLINK_DEPTH  4                 // tc_dsp K: RX words waiting in the FPGA
+// RX words the ARM lets out before the host takes them (<= DSPLINK_DEPTH).
+// A 56001 has two words between its program and the host (HTX and the
+// host's RX); every word beyond that is one the host has not asked for
+// yet, and at the end of a DMA block the host reads those as DSP messages.
+// A debug knob: the file NEXT_DSP_DIR/rxdepth overrides it (see profiling).
+static int rx_depth = DSPLINK_DEPTH;
 #define DSP_HZ         25000000          // the DSP's clock; instr_cycle counts it
 #define HC_WATCHDOG    (1u << 20)        // instructions before an unreturned handler is acked
 #define DSP_RAM_WORDS  8192              // the NeXT's 8K words (24 KB); 32768 with the expansion
+
+// log lines go out at once (Main's stdout is a file, fully buffered)
+static void nlog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void nlog(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	fputs("[next-dsp] ", stdout);
+	vprintf(fmt, ap);
+	va_end(ap);
+	fflush(stdout);
+}
+
+// the link's event trace: the last TRACE_N host-port events, for a hang
+// (written with the link state by the "trace" trigger file, see profiling)
+enum { EV_H2D = 1, EV_HOLD, EV_PARK, EV_UNPARK, EV_D2H, EV_HCTAKEN, EV_HIRESET, EV_SKIPRESET };
+struct trace_ev { uint64_t instrs; uint16_t pc; uint8_t kind, type; uint32_t data; };
+#define TRACE_N 65536
+static trace_ev trace_buf[TRACE_N];
+static uint32_t trace_n;
+static void trace(int kind, int type, uint32_t data);
 
 // the DSP's external RAM (DSP_EnableMemory)
 static uint32_t dsp_ram[32768];
@@ -139,6 +166,8 @@ static int txq_rd, txq_n;
 static int tx_outstanding;               // words the FPGA counts as with us (tc_dsp tx_out)
 
 static int rx_out;                       // R_RX words not yet acknowledged
+static uint64_t rx_words, tx_words;      // words to / from the host (debug, the trace)
+static uint64_t starved_polls;           // ring polls while starved of RX credits (link_step)
 static uint8_t last_hf;                  // ISR HF3:HF2 last sent
 static int last_txd;
 
@@ -164,6 +193,7 @@ static void d2h_flush(void);
 static void d2h(int type, uint32_t data)
 {
 	uint64_t m = ((uint64_t)(type & 0xFF) << 56) | ((uint64_t)epoch << 48) | (data & 0xFFFFFF);
+	trace(EV_D2H, type, data & 0xFFFFFF);
 	if (pend_n == 0 && (uint16_t)(d2h_wr - f_d2h_rd) < RING_N)
 	{
 		wr64(OFF_D2H + 8 * (d2h_wr & 0xFF), m);
@@ -178,7 +208,7 @@ static void d2h(int type, uint32_t data)
 	}
 	else
 	{
-		printf("[next-dsp] D2H overflow, message %d dropped\n", type);
+		nlog("D2H overflow, message %d dropped\n", type);
 	}
 }
 
@@ -238,6 +268,12 @@ static void dsp_full_reset(void)
 static uint8_t hsr(void) { return (uint8_t)dsp_core.periph[DSP_SPACE_X][DSP_HOST_HSR]; }
 static uint8_t isr(void) { return dsp_core.hostport[CPU_HOST_ISR]; }
 
+static void trace(int kind, int type, uint32_t data)
+{
+	trace_ev &e = trace_buf[trace_n++ % TRACE_N];
+	e.instrs = instrs; e.pc = (uint16_t)dsp_core.pc; e.kind = (uint8_t)kind; e.type = (uint8_t)type; e.data = data;
+}
+
 // local TX empty: every word sent has been read by the DSP
 static int tx_drained(void)
 {
@@ -269,8 +305,9 @@ static void service(void)
 
 	if (parked && (tx_drained() || !dsp_core.running || instrs - park_since >= HC_WATCHDOG))
 	{
-		if (!tx_drained()) printf("[next-dsp] host command %02x applied with host words unread\n", parked_cvr);
+		if (!tx_drained()) nlog("host command %02x applied with host words unread\n", parked_cvr);
 		parked = 0;
+		trace(EV_UNPARK, T_CVR, parked_cvr);
 		dsp_core_write_host(CPU_HOST_CVR, parked_cvr);
 		hc_wait_taken = 1;
 		slice_break = 1;
@@ -278,13 +315,14 @@ static void service(void)
 
 	// RX: the word goes to the FPGA, then the local host takes it so the
 	// DSP sees HTDE again
-	while ((isr() & (1 << CPU_HOST_ISR_RXDF)) && rx_out < DSPLINK_DEPTH && pend_n < PENDQ_N / 2)
+	while ((isr() & (1 << CPU_HOST_ISR_RXDF)) && rx_out < rx_depth && pend_n < PENDQ_N / 2)
 	{
 		uint32_t w = ((uint32_t)dsp_core.hostport[CPU_HOST_RXH] << 16) |
 		             ((uint32_t)dsp_core.hostport[CPU_HOST_RXM] << 8) |
 		             dsp_core.hostport[CPU_HOST_RXL];
 		d2h(R_RX, w);
 		rx_out++;
+		rx_words++;
 		dsp_core_read_host(CPU_HOST_TRXL);
 	}
 
@@ -329,7 +367,7 @@ static void service(void)
 	}
 	if (hc_state != HC_NONE && hc_count >= HC_WATCHDOG)
 	{
-		printf("[next-dsp] host command handler did not return (pc %04x): acked\n", dsp_core.pc);
+		nlog("host command handler did not return (pc %04x): acked\n", dsp_core.pc);
 		hc_state = HC_NONE;
 		d2h(R_HCACK, 0);
 	}
@@ -369,6 +407,7 @@ extern "C" void dsp_link_hi_reset(void)
 	// the RESET instruction: the host side goes back to ICR 0, CVR $12,
 	// ISR TRDY|TXDE.  Words in TX are gone; HRX stays for the DSP to read.
 	int keep = (hsr() & (1 << DSP_HOST_HSR_HRDF)) ? 1 : 0;
+	trace(EV_HIRESET, 0, keep);
 	txq_rd = txq_n = 0;
 	d2h(R_HIRESET, 0);
 	while (tx_outstanding > keep)
@@ -381,6 +420,7 @@ extern "C" void dsp_link_hi_reset(void)
 
 extern "C" void dsp_link_hc_taken(void)
 {
+	trace(EV_HCTAKEN, hc_state, dsp_core.registers[DSP_REG_SP] & 0xF);
 	if (hc_state != HC_NONE) d2h(R_HCACK, 0);   // the previous one cannot still be running
 	hc_state = HC_PIPE;
 	hc_sp = dsp_core.registers[DSP_REG_SP] & 0xF;
@@ -393,9 +433,10 @@ extern "C" void next_dsp_log(int level, const char *fmt, ...)
 	if (level > 2) return;                       // LOG_WARN and worse
 	va_list ap;
 	va_start(ap, fmt);
-	printf("[next-dsp] ");
+	fputs("[next-dsp] ", stdout);
 	vprintf(fmt, ap);
 	va_end(ap);
+	fflush(stdout);
 }
 
 //----------------------------------------------------------------------------
@@ -424,13 +465,14 @@ static int h2d_handle(uint64_t m)
 		if (type == T_CVR && (data & 0x80) && !parked)
 		{
 			parked = 1; parked_cvr = (uint8_t)data; park_since = instrs;
+			trace(EV_PARK, type, data);
 			epoch = ep;
 			msgs++;
 			return 1;
 		}
 		if (type == T_ICR && !(data & 0x80))
 		{
-			if (!hold_on) { hold_on = 1; hold_since = instrs; }
+			if (!hold_on) { hold_on = 1; hold_since = instrs; trace(EV_HOLD, type, data); }
 			if (instrs - hold_since < ICR_HOLD) return 0;
 		}
 	}
@@ -439,6 +481,7 @@ static int h2d_handle(uint64_t m)
 
 	epoch = ep;
 	msgs++;
+	trace(EV_H2D, type, data | ((uint32_t)ep << 24));
 
 	switch (type)
 	{
@@ -447,13 +490,14 @@ static int h2d_handle(uint64_t m)
 		{
 			txq[(txq_rd + txq_n) % TXQ_N] = data;
 			txq_n++;
+			tx_words++;
 			// a 56001 reads a host word within microseconds: the host gets
 			// TXDE for it at once while a few wait here (the DSP reads them
 			// later, in order); beyond that only when the DSP reads one
 			if (txq_n <= TX_EARLY_ACK) d2h(R_HRXACK, 0);
 			else tx_outstanding++;
 		}
-		else printf("[next-dsp] host TX overrun\n");
+		else nlog("host TX overrun\n");
 		tx_feed();
 		break;
 
@@ -494,7 +538,7 @@ static int h2d_handle(uint64_t m)
 		break;
 
 	default:
-		printf("[next-dsp] unknown message %016llx\n", (unsigned long long)m);
+		nlog("unknown message %016llx\n", (unsigned long long)m);
 		break;
 	}
 	return 1;
@@ -507,6 +551,7 @@ static int h2d_skip_to_reset(void)
 	{
 		if (h2d_type(h2d_at(i)) == T_RESET)
 		{
+			trace(EV_SKIPRESET, T_RESET, (uint16_t)(i - h2d_rd));
 			h2d_rd = i;
 			arm_dirty = 1;
 			hc_wait_taken = 0;
@@ -525,7 +570,10 @@ static void h2d_poll(void)
 	{
 		// held behind a host command the DSP has not taken yet, and for
 		// the first instructions of its handler
-		if ((hc_wait_taken && (hsr() & (1 << DSP_HOST_HSR_HCP))) ||
+		// (not while the DSP cannot take it: in reset or in the bootstrap
+		// ROM, a 56001's host still writes TX and ICR with HC pending, and
+		// the bootstrap needs those words)
+		if ((hc_wait_taken && (hsr() & (1 << DSP_HOST_HSR_HCP)) && dsp_core.running && dsp_core.mode != 1) ||
 		    (hc_state != HC_NONE && hc_hold_left))
 		{
 			if (!h2d_skip_to_reset()) return;
@@ -579,7 +627,7 @@ static void fpga_word(void)
 		f_h2d_wr = 0;
 		f_d2h_rd = 0;
 		arm_word();
-		printf("[next-dsp] linked to core generation %u\n", g);
+		nlog("linked to core generation %u\n", g);
 		f = rd64(OFF_FPGA);
 		if ((uint16_t)(f >> 32) != gen) return;
 	}
@@ -600,6 +648,8 @@ static void debug_word(void)
 //                 touch prof          counters on (cleared when armed)
 //                 echo LABEL > dump   writes LABEL.bin
 //                 rm prof             counters off
+//                 echo LABEL > trace  writes LABEL.txt: the link state and
+//                                     its last 64K host-port events
 // The dump (little endian) is a prof_hdr, then registers[64], stack[2][16]
 // (u16), rom[3][512], ramint[3][512], periph[2][64], ramext[ramext_words],
 // the PC histogram[65536], the non-parallel opcode histogram[512] (Hatari's
@@ -719,6 +769,56 @@ int next_dsp_prof_dump(const char *path)
 	return prof_dump(path);
 }
 
+
+// the link state and the trace, as text (the "trace" trigger file)
+static int trace_dump(const char *path)
+{
+	static const char *hn[] = { "?", "T_TX", "T_ICR", "T_CVR", "T_RXACK", "T_RESET", "T_START", "T_MEM", "T_IRQB" };
+	static const char *dn[] = { "?", "R_RX", "R_HRXACK", "R_FLAGS", "R_HCACK", "R_TXD", "R_HIRESET" };
+	static const char *kn[] = { "?", "h2d", "HOLD", "PARK", "UNPARK", "d2h", "HC-TAKEN", "HI-RESET", "SKIP-TO-RESET" };
+	FILE *f = fopen(path, "w");
+	if (!f) return -1;
+	fprintf(f, "linked %d gen %u running %d mode %u pc %04x instrs %llu msgs %u epoch %02x\n",
+	        linked, gen, dsp_core.running, dsp_core.mode, dsp_core.pc, (unsigned long long)instrs, msgs, epoch);
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	fprintf(f, "monotonic %ld.%03ld s  words to host %llu, from host %llu, starved polls %llu\n",
+	        (long)ts.tv_sec, ts.tv_nsec / 1000000, (unsigned long long)rx_words, (unsigned long long)tx_words,
+	        (unsigned long long)starved_polls);
+	fprintf(f, "h2d_rd %u fpga h2d_wr %u (%u waiting)  d2h_wr %u fpga d2h_rd %u  pend_n %d\n",
+	        h2d_rd, f_h2d_wr, (uint16_t)(f_h2d_wr - h2d_rd), d2h_wr, f_d2h_rd, pend_n);
+	fprintf(f, "rx_depth %d  ", rx_depth);
+	fprintf(f, "txq_n %d tx_outstanding %d rx_out %d last_hf %02x parked %d (cvr %02x) hold_on %d\n",
+	        txq_n, tx_outstanding, rx_out, last_hf, parked, parked_cvr, hold_on);
+	fprintf(f, "hc_state %d hc_wait_taken %d hc_hold_left %u hc_count %u\n", hc_state, hc_wait_taken, hc_hold_left, hc_count);
+	fprintf(f, "host side: ICR %02x CVR %02x ISR %02x; DSP side: HCR %02x HSR %02x; interrupt_state %u SR %06x SP %02x\n",
+	        dsp_core.hostport[CPU_HOST_ICR], dsp_core.hostport[CPU_HOST_CVR], isr(),
+	        dsp_core.periph[DSP_SPACE_X][DSP_HOST_HCR], hsr(), dsp_core.interrupt_state,
+	        dsp_core.registers[DSP_REG_SR], dsp_core.registers[DSP_REG_SP]);
+	fprintf(f, "\nH2D waiting in the ring:\n");
+	for (uint16_t i = h2d_rd; i != f_h2d_wr && (uint16_t)(i - h2d_rd) < 64; i++)
+	{
+		uint64_t m = h2d_at(i);
+		int t = h2d_type(m);
+		fprintf(f, "  [%u] %-8s %06x epoch %02x\n", i, t < 9 ? hn[t] : "?", (unsigned)(m & 0xFFFFFF), (unsigned)(uint8_t)(m >> 48));
+	}
+	uint32_t n = trace_n < TRACE_N ? trace_n : TRACE_N;
+	fprintf(f, "\nlast %u events (instrs, pc, event):\n", n);
+	for (uint32_t k = trace_n - n; k != trace_n; k++)
+	{
+		const trace_ev &e = trace_buf[k % TRACE_N];
+		const char *tn = e.kind == EV_D2H ? (e.type < 7 ? dn[e.type] : "?") : (e.type < 9 ? hn[e.type] : "?");
+		if (e.kind == EV_HCTAKEN || e.kind == EV_HIRESET) tn = "";
+		fprintf(f, "%12llu %04x %-13s %-8s %06x\n", (unsigned long long)e.instrs, e.pc,
+		        e.kind < 9 ? kn[e.kind] : "?", tn, e.data);
+	}
+	int r = ferror(f) ? -1 : 0;
+	fclose(f);
+	return r;
+}
+
+#define STARVED_POLL   16                // instructions between ring polls while starved (a power of 2)
+
 static int link_step(int n)
 {
 	int done = 0;
@@ -738,7 +838,22 @@ static int link_step(int n)
 		done++;
 		instrs++;
 		if (link_busy()) service();
+		// publish at once: the FPGA sees D2H messages (and our H2D read
+		// index) only through the ARM word, so a word sent mid-slice would
+		// otherwise wait for the slice to end
+		if (arm_dirty) arm_word();
 		if (slice_break) break;
+		// starved: the DSP has a word for the host and every RX credit is
+		// out.  The credits come back as T_RXACK, seen only when the ring is
+		// polled, so poll it every STARVED_POLL instructions instead of once
+		// a slice (the window is DSPLINK_DEPTH words per round trip)
+		if (!(done & (STARVED_POLL - 1)) && rx_out >= rx_depth && (isr() & (1 << CPU_HOST_ISR_RXDF)))
+		{
+			starved_polls++;
+			fpga_word();
+			if (f_h2d_wr != h2d_rd) { h2d_poll(); service(); if (arm_dirty) arm_word(); }
+			if (slice_break) break;
+		}
 	}
 
 	if (slice_break || hc_wait_taken)
@@ -805,8 +920,37 @@ static void prof_poll(void)
 	unlink(NEXT_DSP_DIR "/dump");
 	char path[128];
 	snprintf(path, sizeof(path), NEXT_DSP_DIR "/%s.bin", label);
-	printf("[next-dsp] profile %s: %s (%llu instructions)\n", path,
+	nlog("profile %s: %s (%llu instructions)\n", path,
 	       prof_dump(path) ? "write failed" : "written", (unsigned long long)prof_instrs);
+}
+
+static void knob_poll(void)
+{
+	FILE *f = fopen(NEXT_DSP_DIR "/rxdepth", "r");
+	int d = DSPLINK_DEPTH;
+	if (f)
+	{
+		if (fscanf(f, "%d", &d) != 1 || d < 1 || d > DSPLINK_DEPTH) d = DSPLINK_DEPTH;
+		fclose(f);
+	}
+	if (d != rx_depth)
+	{
+		rx_depth = d;
+		nlog("RX depth %d\n", d);
+	}
+}
+
+static void trace_poll(void)
+{
+	FILE *f = fopen(NEXT_DSP_DIR "/trace", "r");
+	if (!f) return;
+	char label[64] = "trace";
+	if (fscanf(f, "%40[A-Za-z0-9_.-]", label) != 1) strcpy(label, "trace");
+	fclose(f);
+	unlink(NEXT_DSP_DIR "/trace");
+	char path[128];
+	snprintf(path, sizeof(path), NEXT_DSP_DIR "/%s.txt", label);
+	nlog("trace %s: %s\n", path, trace_dump(path) ? "write failed" : "written");
 }
 
 static void *dsp_thread(void *)
@@ -823,7 +967,7 @@ static void *dsp_thread(void *)
 		{
 			last_dbg = t;
 			debug_word();
-			if (++prof_poll_n >= 10) { prof_poll_n = 0; prof_poll(); }   // every ~100 ms
+			if (++prof_poll_n >= 10) { prof_poll_n = 0; prof_poll(); trace_poll(); knob_poll(); }   // every ~100 ms
 		}
 
 		if (!linked)
@@ -866,7 +1010,7 @@ void next_dsp_start(void)
 		mb = (volatile uint32_t *)shmem_map(DL_BASE, DL_SIZE);
 		if (!mb)
 		{
-			printf("[next-dsp] shmem_map failed\n");
+			nlog("shmem_map failed\n");
 			return;
 		}
 	}
@@ -884,12 +1028,12 @@ void next_dsp_start(void)
 	if (pthread_create(&thr, &attr, dsp_thread, NULL) == 0)
 	{
 		thr_started = 1;
-		printf("[next-dsp] DSP56001 thread started, waiting for the core link\n");
+		nlog("DSP56001 thread started, waiting for the core link\n");
 	}
 	else
 	{
 		thr_run = 0;
-		printf("[next-dsp] pthread_create failed\n");
+		nlog("pthread_create failed\n");
 	}
 	pthread_attr_destroy(&attr);
 }
@@ -902,7 +1046,7 @@ void next_dsp_stop(void)
 	wr64(OFF_ARM, 0);
 	thr_started = 0;
 	linked = 0;
-	printf("[next-dsp] stopped\n");
+	nlog("stopped\n");
 }
 
 #else  // not Linux: benches only

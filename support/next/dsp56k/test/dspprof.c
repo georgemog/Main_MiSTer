@@ -147,6 +147,17 @@ int main(int argc, char **argv)
 	f = open_dump(argv[1], &hc);   /* back to this dump's registers */
 	load_state(f, &hc);
 	fclose(f);
+	/* DIS=start-end (hex): list that P range from this dump, and stop */
+	const char *dr = getenv("DIS");
+	if (dr) {
+		unsigned a = 0, b = 0;
+		sscanf(dr, "%x-%x", &a, &b);
+		dsp_core.mode = h.mode == 1 ? 0 : h.mode;
+		char t0[256];
+		for (unsigned pc = a; pc <= b && pc < 65536; pc++)
+			printf("p:%04x %6.3f%%  %s\n", pc, 100.0 * pc_h[pc] / (h.instrs ? h.instrs : 1), dis((uint16_t)pc, t0, sizeof(t0)));
+		return 0;
+	}
 
 	double wall = h.wall_ns / 1e9, n = (double)(h.instrs > h.boot_instrs ? h.instrs - h.boot_instrs : 1);
 	printf("# %s\n\n", argv[1]);
