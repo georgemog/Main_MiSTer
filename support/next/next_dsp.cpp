@@ -593,6 +593,119 @@ static void debug_word(void)
 	wr64(OFF_DEBUG, ((uint64_t)(instrs >> 10) << 32) | (flags << 28) | ((msgs & 0xFFF) << 16) | dsp_core.pc);
 }
 
+//----------------------------------------------------------------------------
+// profiling (JIT plan, phase 0): what the DSP runs, for offline analysis
+//----------------------------------------------------------------------------
+// On the MiSTer:  touch /tmp/next_dsp_prof   counters on (cleared when armed)
+//                 echo LABEL > /tmp/next_dsp_dump   writes /tmp/next_dsp_LABEL.bin
+//                 rm /tmp/next_dsp_prof      counters off
+// The dump (little endian) is a prof_hdr, then registers[64], stack[2][16]
+// (u16), rom[3][512], ramint[3][512], periph[2][64], ramext[ramext_words],
+// the PC histogram[65536], the non-parallel opcode histogram[512] (Hatari's
+// opcodes8h index), the parallel-move histogram[16*256] (pm type * ALU byte)
+// and the interrupt vector histogram[64].  support/next/dsp56k/test/dspprof.c
+// reads it.
+
+struct prof_hdr
+{
+	char     magic[8];          // "NXDSPPR1"
+	uint32_t version, hdr_size;
+	uint64_t instrs, cycles, jumps, same_pc, wall_ns, sleep_ns, behind;
+	uint32_t ramext_words, mode;
+	uint16_t pc, pad;
+	uint32_t interrupt_state, loop_rep;
+};
+
+static int prof_on;
+static uint32_t prof_pc[65536], prof_np[512], prof_par[16 * 256], prof_irq[64];
+static uint64_t prof_instrs, prof_cycles, prof_jumps, prof_same, prof_t0, prof_sleep, prof_behind;
+
+static uint64_t prof_now(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+
+static uint32_t p_word(uint16_t pc)
+{
+	if (dsp_core.mode == 1) return dsp_core.rom[DSP_SPACE_P][pc & 0x1f];
+	if (pc < 0x200) return dsp_core.ramint[DSP_SPACE_P][pc];
+	return dsp_core.ramext && DSP_RAMSIZE ? dsp_core.ramext[pc & (DSP_RAMSIZE - 1)] : 0;
+}
+
+static void prof_reset(void)
+{
+	memset(prof_pc, 0, sizeof(prof_pc));
+	memset(prof_np, 0, sizeof(prof_np));
+	memset(prof_par, 0, sizeof(prof_par));
+	memset(prof_irq, 0, sizeof(prof_irq));
+	prof_instrs = prof_cycles = prof_jumps = prof_same = prof_sleep = prof_behind = 0;
+	prof_t0 = prof_now();
+}
+
+// one instruction, run with the counters on (link_step's slow path)
+static void prof_execute(void)
+{
+	uint16_t pc0 = dsp_core.pc;
+	uint32_t op = p_word(pc0) & 0xffffff;
+	uint16_t ist = dsp_core.interrupt_state;
+
+	dsp56k_execute_instruction();
+
+	prof_pc[pc0]++;
+	if (op < 0x100000) prof_np[((op >> 11) & (0x3f << 3)) + ((op >> 5) & 7)]++;
+	else prof_par[((op >> 20) & 0xf) * 256 + (op & 0xff)]++;
+	uint16_t d = (uint16_t)(dsp_core.pc - pc0);
+	if (d == 0) prof_same++;
+	else if (d > 2) prof_jumps++;
+	if (ist == DSP_INTERRUPT_NONE && dsp_core.interrupt_state != DSP_INTERRUPT_NONE)
+		prof_irq[(dsp_core.interrupt_instr_fetch >> 1) & 63]++;
+	prof_instrs++;
+	prof_cycles += dsp_core.instr_cycle;
+}
+
+static int prof_dump(const char *path)
+{
+	FILE *f = fopen(path, "wb");
+	if (!f) return -1;
+	prof_hdr h;
+	memset(&h, 0, sizeof(h));
+	memcpy(h.magic, "NXDSPPR1", 8);
+	h.version = 1;
+	h.hdr_size = sizeof(h);
+	h.instrs = prof_instrs; h.cycles = prof_cycles; h.jumps = prof_jumps; h.same_pc = prof_same;
+	h.wall_ns = prof_now() - prof_t0; h.sleep_ns = prof_sleep; h.behind = prof_behind;
+	h.ramext_words = dsp_core.ramext ? DSP_RAMSIZE : 0;
+	h.mode = dsp_core.mode; h.pc = dsp_core.pc;
+	h.interrupt_state = dsp_core.interrupt_state; h.loop_rep = dsp_core.loop_rep;
+	fwrite(&h, sizeof(h), 1, f);
+	fwrite(dsp_core.registers, sizeof(dsp_core.registers), 1, f);
+	fwrite(dsp_core.stack, sizeof(dsp_core.stack), 1, f);
+	fwrite(dsp_core.rom, sizeof(dsp_core.rom), 1, f);
+	fwrite(dsp_core.ramint, sizeof(dsp_core.ramint), 1, f);
+	fwrite(dsp_core.periph, sizeof(dsp_core.periph), 1, f);
+	if (h.ramext_words) fwrite(dsp_core.ramext, 4, h.ramext_words, f);
+	fwrite(prof_pc, sizeof(prof_pc), 1, f);
+	fwrite(prof_np, sizeof(prof_np), 1, f);
+	fwrite(prof_par, sizeof(prof_par), 1, f);
+	fwrite(prof_irq, sizeof(prof_irq), 1, f);
+	int r = ferror(f) ? -1 : 0;
+	fclose(f);
+	return r;
+}
+
+void next_dsp_prof(int on)
+{
+	if (on && !prof_on) prof_reset();
+	prof_on = on;
+}
+
+int next_dsp_prof_dump(const char *path)
+{
+	return prof_dump(path);
+}
+
 static int link_step(int n)
 {
 	int done = 0;
@@ -606,7 +719,8 @@ static int link_step(int n)
 	slice_break = 0;
 	while (done < n && dsp_core.running && pend_n < PENDQ_N / 2)
 	{
-		dsp56k_execute_instruction();
+		if (prof_on) prof_execute();
+		else dsp56k_execute_instruction();
 		step_cycles += dsp_core.instr_cycle;
 		done++;
 		instrs++;
@@ -661,6 +775,24 @@ static uint64_t now_ns(void)
 	return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
 }
 
+// the trigger files (see "profiling")
+static int prof_poll_n;
+static void prof_poll(void)
+{
+	int armed = access("/tmp/next_dsp_prof", F_OK) == 0;
+	if (armed != prof_on) next_dsp_prof(armed);
+	FILE *f = fopen("/tmp/next_dsp_dump", "r");
+	if (!f) return;
+	char label[64] = "dump";
+	if (fscanf(f, "%40[A-Za-z0-9_.-]", label) != 1) strcpy(label, "dump");
+	fclose(f);
+	unlink("/tmp/next_dsp_dump");
+	char path[128];
+	snprintf(path, sizeof(path), "/tmp/next_dsp_%s.bin", label);
+	printf("[next-dsp] profile %s: %s (%llu instructions)\n", path,
+	       prof_dump(path) ? "write failed" : "written", (unsigned long long)prof_instrs);
+}
+
 static void *dsp_thread(void *)
 {
 	uint64_t t0 = now_ns(), last_dbg = 0;
@@ -675,6 +807,7 @@ static void *dsp_thread(void *)
 		{
 			last_dbg = t;
 			debug_word();
+			if (++prof_poll_n >= 10) { prof_poll_n = 0; prof_poll(); }   // every ~100 ms
 		}
 
 		if (!linked)
@@ -697,11 +830,13 @@ static void *dsp_thread(void *)
 		{
 			struct timespec ts = { 0, (long)(due - t) };
 			nanosleep(&ts, NULL);
+			if (prof_on) prof_sleep += due - t;
 		}
 		else if (t > due + 50000000ull)
 		{
 			// far behind (the interpreter is slower than the DSP): don't bank it
 			t0 = t; step_cycles = 0;
+			if (prof_on) prof_behind++;
 		}
 	}
 	return NULL;

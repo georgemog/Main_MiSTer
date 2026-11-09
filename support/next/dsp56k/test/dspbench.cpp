@@ -8,6 +8,11 @@
 //   kernel boot: the bootstrap ROM's idle loop (JCLR on the host port)
 //   kernel fir:  16-tap FIR, MAC with XY moves, modulo 16, DO loop (P:$40)
 //   link 0: the interpreter alone; 1: through next_dsp_sim_step (in-memory mailbox)
+//   DSPPROF=file (with link 1): profile the run and write a dump for dspprof
+// ./dspbench replay DUMP [n] [pc]: load a next_dsp profile dump (memories,
+//   registers) and run its code from pc (default: the dump's) -- the hot
+//   loops of a captured workload, offline.  Code that waits on the host port
+//   spins, so pick a pc inside a compute loop (dspprof lists them).
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -44,8 +49,47 @@ static void load_fir(void)
 	dsp_core.pc = 0x40;
 }
 
+struct prof_hdr {
+	char     magic[8];
+	uint32_t version, hdr_size;
+	uint64_t instrs, cycles, jumps, same_pc, wall_ns, sleep_ns, behind;
+	uint32_t ramext_words, mode;
+	uint16_t pc, pad;
+	uint32_t interrupt_state, loop_rep;
+};
+
+static int replay(const char *path, long n, int pc)
+{
+	FILE *f = fopen(path, "rb");
+	if (!f) { perror(path); return 1; }
+	prof_hdr h;
+	static uint32_t ram[32768];
+	if (fread(&h, sizeof(h), 1, f) != 1 || memcmp(h.magic, "NXDSPPR1", 8)) { printf("not a dump\n"); return 1; }
+	dsp_core_init(hi);
+	dsp_core_reset();
+	size_t ok = fread(dsp_core.registers, sizeof(dsp_core.registers), 1, f);
+	ok += fread(dsp_core.stack, sizeof(dsp_core.stack), 1, f);
+	ok += fread(dsp_core.rom, sizeof(dsp_core.rom), 1, f);
+	ok += fread(dsp_core.ramint, sizeof(dsp_core.ramint), 1, f);
+	ok += fread(dsp_core.periph, sizeof(dsp_core.periph), 1, f);
+	if (h.ramext_words) { dsp_core_config_ramext(ram, h.ramext_words); ok += fread(ram, 4 * h.ramext_words, 1, f) ? 1 : 0; }
+	fclose(f);
+	dsp_core.mode = h.mode;
+	dsp_core.pc = pc >= 0 ? pc : h.pc;
+	dsp_core.running = 1;
+	for (int i = 0; i < 1000; i++) dsp56k_execute_instruction();
+	double t0 = cpu_s();
+	for (long i = 0; i < n; i++) dsp56k_execute_instruction();
+	double t1 = cpu_s();
+	printf("replay %s from %04x: %ld instr in %.3f s CPU = %5.2f MIPS  pc %04x\n", path, pc >= 0 ? pc : h.pc, n, t1 - t0,
+	       n / (t1 - t0) / 1e6, dsp_core.pc);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
+	if (argc > 2 && !strcmp(argv[1], "replay"))
+		return replay(argv[2], argc > 3 ? atol(argv[3]) : 20000000, argc > 4 ? (int)strtol(argv[4], 0, 16) : -1);
 	const char *k = argc > 1 ? argv[1] : "boot";
 	int link = argc > 2 ? atoi(argv[2]) : 0;
 	long n = argc > 3 ? atol(argv[3]) : 20000000;
@@ -60,9 +104,12 @@ int main(int argc, char **argv)
 		mb[0] = (0xD5F1ull << 48) | (1ull << 32) | 1;       // h2d_wr = 1
 		next_dsp_sim_step(16);
 		if (fir) load_fir();
+		const char *pf = getenv("DSPPROF");
+		if (pf) next_dsp_prof(1);
 		t0 = cpu_s();
 		while (done < n) { int s = next_dsp_sim_step(256); if (!s) { printf("stalled\n"); break; } done += s; }
 		t1 = cpu_s();
+		if (pf) printf("profile %s: %s\n", pf, next_dsp_prof_dump(pf) ? "failed" : "written");
 	} else {
 		dsp_core_init(hi);
 		dsp_core_reset();
