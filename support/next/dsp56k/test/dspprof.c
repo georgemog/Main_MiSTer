@@ -1,5 +1,5 @@
 /*
- * dspprof DUMP [ntop] [CODEDUMP...]: read a next_dsp profile dump (/tmp/next_dsp_LABEL.bin)
+ * dspprof DUMP [ntop] [CODEDUMP...]: read a next_dsp profile dump (/media/usb0/next_dsp/LABEL.bin)
  * and print where the DSP's time went, for the JIT plan (phase 0).
  *
  *   cc -O2 -w -I.. -o dspprof dspprof.c hooks.c ../dsp_core.c ../dsp_cpu.c ../dsp_disasm.c

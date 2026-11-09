@@ -596,9 +596,10 @@ static void debug_word(void)
 //----------------------------------------------------------------------------
 // profiling (JIT plan, phase 0): what the DSP runs, for offline analysis
 //----------------------------------------------------------------------------
-// On the MiSTer:  touch /tmp/next_dsp_prof   counters on (cleared when armed)
-//                 echo LABEL > /tmp/next_dsp_dump   writes /tmp/next_dsp_LABEL.bin
-//                 rm /tmp/next_dsp_prof      counters off
+// On the MiSTer, in NEXT_DSP_DIR (on the USB disk, not the /tmp tmpfs):
+//                 touch prof          counters on (cleared when armed)
+//                 echo LABEL > dump   writes LABEL.bin
+//                 rm prof             counters off
 // The dump (little endian) is a prof_hdr, then registers[64], stack[2][16]
 // (u16), rom[3][512], ramint[3][512], periph[2][64], ramext[ramext_words],
 // the PC histogram[65536], the non-parallel opcode histogram[512] (Hatari's
@@ -788,19 +789,22 @@ static uint64_t now_ns(void)
 }
 
 // the trigger files (see "profiling")
+#ifndef NEXT_DSP_DIR
+#define NEXT_DSP_DIR "/media/usb0/next_dsp"
+#endif
 static int prof_poll_n;
 static void prof_poll(void)
 {
-	int armed = access("/tmp/next_dsp_prof", F_OK) == 0;
+	int armed = access(NEXT_DSP_DIR "/prof", F_OK) == 0;
 	if (armed != prof_on) next_dsp_prof(armed);
-	FILE *f = fopen("/tmp/next_dsp_dump", "r");
+	FILE *f = fopen(NEXT_DSP_DIR "/dump", "r");
 	if (!f) return;
 	char label[64] = "dump";
 	if (fscanf(f, "%40[A-Za-z0-9_.-]", label) != 1) strcpy(label, "dump");
 	fclose(f);
-	unlink("/tmp/next_dsp_dump");
+	unlink(NEXT_DSP_DIR "/dump");
 	char path[128];
-	snprintf(path, sizeof(path), "/tmp/next_dsp_%s.bin", label);
+	snprintf(path, sizeof(path), NEXT_DSP_DIR "/%s.bin", label);
 	printf("[next-dsp] profile %s: %s (%llu instructions)\n", path,
 	       prof_dump(path) ? "write failed" : "written", (unsigned long long)prof_instrs);
 }

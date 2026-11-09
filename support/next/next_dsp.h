@@ -29,8 +29,8 @@ typedef void (*next_dsp_wr_t)(uint32_t off, uint64_t v);
 void next_dsp_sim_attach(next_dsp_rd_t rd, next_dsp_wr_t wr);
 int  next_dsp_sim_step(int n);
 
-// Profiling (JIT plan phase 0; on the MiSTer also via /tmp/next_dsp_prof and
-// /tmp/next_dsp_dump, see next_dsp.cpp): counters on/off, and a dump of the
+// Profiling (JIT plan phase 0; on the MiSTer also via the prof and dump
+// files in /media/usb0/next_dsp, see next_dsp.cpp): counters on/off, and a dump of the
 // DSP's memories, registers and the counters for support/next/dsp56k/test/dspprof.
 void next_dsp_prof(int on);
 int  next_dsp_prof_dump(const char *path);
