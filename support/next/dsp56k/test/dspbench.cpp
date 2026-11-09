@@ -56,6 +56,7 @@ struct prof_hdr {
 	uint32_t ramext_words, mode;
 	uint16_t pc, pad;
 	uint32_t interrupt_state, loop_rep;
+	uint64_t boot_instrs;
 };
 
 static int replay(const char *path, long n, int pc)
@@ -64,7 +65,7 @@ static int replay(const char *path, long n, int pc)
 	if (!f) { perror(path); return 1; }
 	prof_hdr h;
 	static uint32_t ram[32768];
-	if (fread(&h, sizeof(h), 1, f) != 1 || memcmp(h.magic, "NXDSPPR1", 8)) { printf("not a dump\n"); return 1; }
+	if (fread(&h, sizeof(h), 1, f) != 1 || memcmp(h.magic, "NXDSPPR2", 8)) { printf("not a dump\n"); return 1; }
 	dsp_core_init(hi);
 	dsp_core_reset();
 	size_t ok = fread(dsp_core.registers, sizeof(dsp_core.registers), 1, f);

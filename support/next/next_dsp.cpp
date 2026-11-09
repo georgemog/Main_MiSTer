@@ -608,17 +608,18 @@ static void debug_word(void)
 
 struct prof_hdr
 {
-	char     magic[8];          // "NXDSPPR1"
+	char     magic[8];          // "NXDSPPR2"
 	uint32_t version, hdr_size;
 	uint64_t instrs, cycles, jumps, same_pc, wall_ns, sleep_ns, behind;
 	uint32_t ramext_words, mode;
 	uint16_t pc, pad;
 	uint32_t interrupt_state, loop_rep;
+	uint64_t boot_instrs;       // of instrs: in the bootstrap ROM (mode 1), not in the histograms
 };
 
 static int prof_on;
 static uint32_t prof_pc[65536], prof_np[512], prof_par[16 * 256], prof_irq[64];
-static uint64_t prof_instrs, prof_cycles, prof_jumps, prof_same, prof_t0, prof_sleep, prof_behind;
+static uint64_t prof_instrs, prof_cycles, prof_jumps, prof_same, prof_t0, prof_sleep, prof_behind, prof_boot;
 
 static uint64_t prof_now(void)
 {
@@ -640,13 +641,23 @@ static void prof_reset(void)
 	memset(prof_np, 0, sizeof(prof_np));
 	memset(prof_par, 0, sizeof(prof_par));
 	memset(prof_irq, 0, sizeof(prof_irq));
-	prof_instrs = prof_cycles = prof_jumps = prof_same = prof_sleep = prof_behind = 0;
+	prof_instrs = prof_cycles = prof_jumps = prof_same = prof_sleep = prof_behind = prof_boot = 0;
 	prof_t0 = prof_now();
 }
 
 // one instruction, run with the counters on (link_step's slow path)
 static void prof_execute(void)
 {
+	if (dsp_core.mode == 1)
+	{
+		// the bootstrap ROM (loading a program, or idle waiting for one):
+		// counted apart so its PCs don't mix with the program's
+		dsp56k_execute_instruction();
+		prof_boot++;
+		prof_instrs++;
+		prof_cycles += dsp_core.instr_cycle;
+		return;
+	}
 	uint16_t pc0 = dsp_core.pc;
 	uint32_t op = p_word(pc0) & 0xffffff;
 	uint16_t ist = dsp_core.interrupt_state;
@@ -671,14 +682,15 @@ static int prof_dump(const char *path)
 	if (!f) return -1;
 	prof_hdr h;
 	memset(&h, 0, sizeof(h));
-	memcpy(h.magic, "NXDSPPR1", 8);
-	h.version = 1;
+	memcpy(h.magic, "NXDSPPR2", 8);
+	h.version = 2;
 	h.hdr_size = sizeof(h);
 	h.instrs = prof_instrs; h.cycles = prof_cycles; h.jumps = prof_jumps; h.same_pc = prof_same;
 	h.wall_ns = prof_now() - prof_t0; h.sleep_ns = prof_sleep; h.behind = prof_behind;
 	h.ramext_words = dsp_core.ramext ? DSP_RAMSIZE : 0;
 	h.mode = dsp_core.mode; h.pc = dsp_core.pc;
 	h.interrupt_state = dsp_core.interrupt_state; h.loop_rep = dsp_core.loop_rep;
+	h.boot_instrs = prof_boot;
 	fwrite(&h, sizeof(h), 1, f);
 	fwrite(dsp_core.registers, sizeof(dsp_core.registers), 1, f);
 	fwrite(dsp_core.stack, sizeof(dsp_core.stack), 1, f);
