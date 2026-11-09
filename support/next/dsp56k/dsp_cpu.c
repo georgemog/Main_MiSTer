@@ -766,6 +766,277 @@ const char *dsp_interrupt_name[32] = {
 
 
 /**********************************
+ *	NeXT-Color soft DSP (JIT plan, phase 1): decoded-instruction cache
+ *
+ *	Decoding is a pure function of the P word, so each P address keeps the
+ *	last word it decoded and its decode: the handler, the parallel-move ALU
+ *	op and the move's fields.  The fetch compares the word with the entry;
+ *	a different word (code loaded or changed, bootstrap ROM vs RAM) decodes
+ *	again, so no invalidation is needed.  The hot parallel-move forms (XY,
+ *	X:/Y:, register, none) have handlers that take their fields from the
+ *	entry; they follow Hatari's dsp_pm_* order of side effects exactly.
+ *	Everything else calls Hatari's handler.
+ **********************************/
+
+#ifndef DSP_DEC_CACHE
+#define DSP_DEC_CACHE 1
+#endif
+
+typedef struct dsp_dec_s dsp_dec_t;
+typedef void (*dsp_dec_fn)(const dsp_dec_t *);
+struct dsp_dec_s {
+	uint32_t   tag;	/* ~(the P word decoded here): 0 (zeroed cache) matches no word */
+	dsp_dec_fn fn;
+	dsp_emul_t op;		/* ALU op (parallel form) or Hatari handler */
+	uint8_t    a, b, c, f;	/* fields, per form; f: DEC_* flags | D2 << 3 */
+};
+
+#define DEC_W	(1 << 0)	/* move writes the register (memory -> D) */
+#define DEC_EA	(1 << 1)	/* X:/Y: move: effective address, not absolute */
+#define DEC_W2	(1 << 2)	/* XY move: second move writes the register */
+
+/* 4096 entries of 16 bytes (L2-resident); any index is correct since the
+   tag is the word, the hash only keeps the internal ($0-$1ff) and external
+   ($2000-$3fff) program areas apart */
+#define DEC_N	4096
+#define DEC_IDX(pc)	(((pc) ^ ((pc) >> 4)) & (DEC_N - 1))
+static dsp_dec_t dec_cache[DEC_N];
+
+/* X/Y memory, internal RAM inline (same as read_memory/write_memory_raw) */
+static inline uint32_t dec_read_xy(int space, uint32_t address)
+{
+	if (address < 0x100)
+		return dsp_core.ramint[space][address] & BITMASK(24);
+	return read_memory(space, address);
+}
+
+static inline void dec_write_xy(int space, uint32_t address, uint32_t value)
+{
+	if (address < 0x100 && !LOG_TRACE_LEVEL(TRACE_DSP_DISASM_MEM))
+		dsp_core.ramint[space][address] = value & BITMASK(24);
+	else
+		write_memory(space, address, value);
+}
+
+/* dsp_calc_ea for the post-update and no-update modes, inline */
+static inline __attribute__((always_inline)) void dec_ea(uint32_t ea_mode, uint32_t *dst_addr)
+{
+	uint32_t mode = (ea_mode >> 3) & BITMASK(3);
+	uint32_t numreg = ea_mode & BITMASK(3);
+	uint32_t reg_r, reg_n, reg_m;
+
+	if (mode > 4) {
+		dsp_calc_ea(ea_mode, dst_addr);
+		return;
+	}
+	reg_r = dsp_core.registers[DSP_REG_R0+numreg];
+	reg_n = dsp_core.registers[DSP_REG_N0+numreg];
+	reg_m = dsp_core.registers[DSP_REG_M0+numreg];
+	if (dsp_core.agu_pipeline_reg[0] != 0) {
+		uint32_t pr = dsp_core.agu_pipeline_reg[0];
+		if (pr == DSP_REG_R0+numreg)
+			reg_r = dsp_core.agu_pipeline_val[0];
+		else if (pr == DSP_REG_N0+numreg)
+			reg_n = dsp_core.agu_pipeline_val[0];
+		else if (pr == DSP_REG_M0+numreg)
+			reg_m = dsp_core.agu_pipeline_val[0];
+	}
+	*dst_addr = reg_r;
+	switch (mode) {
+		case 0: dsp_update_rn(numreg, reg_r, -reg_n, reg_m); break;
+		case 1: dsp_update_rn(numreg, reg_r, +reg_n, reg_m); break;
+		case 2: dsp_update_rn(numreg, reg_r, -1, reg_m); break;
+		case 3: dsp_update_rn(numreg, reg_r, +1, reg_m); break;
+		default: break;
+	}
+}
+
+static inline uint32_t dec_read_src(uint32_t numreg)
+{
+	uint32_t v;
+	if ((numreg == DSP_REG_A) || (numreg == DSP_REG_B)) {
+		/* no scaling, no limiting: A1/B1 (as dsp_pm_read_accu24) */
+		uint32_t r = numreg & 1, a2 = dsp_core.registers[DSP_REG_A2+r], a1 = dsp_core.registers[DSP_REG_A1+r];
+		if (!(dsp_core.registers[DSP_REG_SR] & (3<<DSP_SR_S0)) && a1 <= BITMASK(24) &&
+		    ((a2 == 0 && a1 <= 0x7fffff) || (a2 == 0xff && a1 >= 0x800000)))
+			return a1;
+		dsp_pm_read_accu24(numreg, &v);
+	}
+	else
+		v = dsp_core.registers[numreg];
+	return v;
+}
+
+static inline void dec_write_accu(uint32_t numreg, uint32_t v)
+{
+	uint32_t r = numreg & 1;
+	dsp_core.registers[DSP_REG_A0+r] = 0x0;
+	dsp_core.registers[DSP_REG_A1+r] = v;
+	dsp_core.registers[DSP_REG_A2+r] = v & (1<<23) ? 0xff : 0x0;
+}
+
+/* not a parallel move, or a rare form: Hatari's handler */
+static void dec_hatari(const dsp_dec_t *d)
+{
+	d->op();
+}
+
+/* 0010 0000 0000 0000: no move */
+static void dec_pm_none(const dsp_dec_t *d)
+{
+	d->op();
+}
+
+/* 0010 00ee eeed dddd S,D (dsp_pm_2_2) */
+static void dec_pm_reg(const dsp_dec_t *d)
+{
+	uint32_t save_reg = dec_read_src(d->a);
+
+	d->op();
+	dsp_core.agu_move_indirect_instr = 1;
+	dsp_write_reg(d->b, save_reg);
+}
+
+/* 01dd 0ddd w?mm mrrr X: or Y: move (dsp_pm_5) */
+static void dec_pm_xy1(const dsp_dec_t *d)
+{
+	uint32_t memspace = d->c, numreg = d->b, value, xy_addr;
+	int retour = 0;
+
+	if (d->f & DEC_EA) {
+		if ((d->a >> 3) <= 4) {
+			dec_ea(d->a, &xy_addr);
+		} else {
+			retour = dsp_calc_ea(d->a, &xy_addr);
+		}
+	} else {
+		xy_addr = d->a;
+	}
+
+	if (d->f & DEC_W) {
+		value = retour ? xy_addr : dec_read_xy(memspace, xy_addr);
+	} else {
+		value = dec_read_src(numreg);
+	}
+
+	d->op();
+
+	if (d->f & DEC_W) {
+		dsp_core.agu_move_indirect_instr = 1;
+		dsp_write_reg(numreg, value);
+	} else {
+		dec_write_xy(memspace, xy_addr, value);
+	}
+}
+
+/* 1wmm eeff WrrM MRRR XY move (dsp_pm_8); a, b: ea1, ea2; c, d: D1, D2 */
+static void dec_pm_xy2(const dsp_dec_t *d)
+{
+	uint32_t x_addr, y_addr, save_reg1, save_reg2;
+	uint32_t numreg1 = d->c, numreg2 = d->f >> 3;
+
+	dec_ea(d->a, &x_addr);
+	dec_ea(d->b, &y_addr);
+
+	if (d->f & DEC_W)
+		save_reg1 = dec_read_xy(DSP_SPACE_X, x_addr);
+	else
+		save_reg1 = dec_read_src(numreg1);
+
+	if (d->f & DEC_W2)
+		save_reg2 = dec_read_xy(DSP_SPACE_Y, y_addr);
+	else
+		save_reg2 = dec_read_src(numreg2);
+
+	d->op();
+
+	if (d->f & DEC_W) {
+		if ((numreg1 == DSP_REG_A) || (numreg1 == DSP_REG_B))
+			dec_write_accu(numreg1, save_reg1);
+		else
+			dsp_core.registers[numreg1] = save_reg1;
+	} else {
+		dec_write_xy(DSP_SPACE_X, x_addr, save_reg1);
+	}
+
+	if (d->f & DEC_W2) {
+		if ((numreg2 == DSP_REG_A) || (numreg2 == DSP_REG_B))
+			dec_write_accu(numreg2, save_reg2);
+		else
+			dsp_core.registers[numreg2] = save_reg2;
+	} else {
+		dec_write_xy(DSP_SPACE_Y, y_addr, save_reg2);
+	}
+}
+
+static void dec_fill(dsp_dec_t *d, uint32_t inst)
+{
+	static const uint8_t xreg[4] = { DSP_REG_X0, DSP_REG_X1, DSP_REG_A, DSP_REG_B };
+	static const uint8_t yreg[4] = { DSP_REG_Y0, DSP_REG_Y1, DSP_REG_A, DSP_REG_B };
+	uint32_t ea1, ea2;
+
+	d->tag = ~inst;
+	d->a = d->b = d->c = d->f = 0;
+
+	if (inst < 0x100000) {
+		uint32_t value = (inst >> 11) & (BITMASK(6) << 3);
+		value += (inst >> 5) & BITMASK(3);
+		d->fn = dec_hatari;
+		d->op = opcodes8h[value];
+		return;
+	}
+
+	d->fn = dec_hatari;
+	d->op = opcodes_parmove[(inst>>20) & BITMASK(4)];
+
+	switch ((inst >> 20) & BITMASK(4)) {
+	case 2:
+		if ((inst & 0xffff00) == 0x200000) {
+			d->fn = dec_pm_none;
+		} else if ((inst & 0xffe000) == 0x204000) {
+			/* R update: Hatari */
+		} else if ((inst & 0xfc0000) == 0x200000) {
+			d->fn = dec_pm_reg;
+			d->a = (inst >> 13) & BITMASK(5);
+			d->b = (inst >> 8) & BITMASK(5);
+		}
+		break;
+	case 4:
+		if ((inst & 0xf40000) == 0x400000)
+			break;	/* L: move: Hatari */
+		/* fall through */
+	case 5: case 6: case 7:
+		d->fn = dec_pm_xy1;
+		d->a = (inst >> 8) & BITMASK(6);
+		d->c = (inst >> 19) & 1;
+		d->b = ((inst >> 16) & BITMASK(3)) | ((inst >> 17) & (BITMASK(2) << 3));
+		d->f = ((inst & (1<<15)) ? DEC_W : 0) | ((inst & (1<<14)) ? DEC_EA : 0);
+		break;
+	case 8: case 9: case 10: case 11: case 12: case 13: case 14: case 15:
+		ea1 = (inst >> 8) & BITMASK(5);
+		if ((ea1 >> 3) == 0)
+			ea1 |= (1<<5);
+		ea2 = (inst >> 13) & BITMASK(2);
+		ea2 |= (inst >> 17) & (BITMASK(2) << 3);
+		if ((ea1 & (1<<2)) == 0)
+			ea2 |= 1<<2;
+		if ((ea2 >> 3) == 0)
+			ea2 |= (1<<5);
+		d->fn = dec_pm_xy2;
+		d->a = ea1;
+		d->b = ea2;
+		d->c = xreg[(inst >> 18) & BITMASK(2)];
+		d->f = ((inst & (1<<15)) ? DEC_W : 0) | ((inst & (1<<22)) ? DEC_W2 : 0) | (yreg[(inst >> 16) & BITMASK(2)] << 3);
+		break;
+	default:
+		break;
+	}
+	if (d->fn != dec_hatari)
+		d->op = opcodes_alu[inst & BITMASK(8)];
+}
+
+
+/**********************************
  *	Emulator kernel
  **********************************/
 
@@ -863,6 +1134,15 @@ void dsp56k_execute_instruction(void)
 		}
 	}
 
+#if DSP_DEC_CACHE
+	/* NeXT-Color soft DSP: decode once per P word (dec_cache) */
+	{
+		dsp_dec_t *d = &dec_cache[DEC_IDX(dsp_core.pc)];
+		if (__builtin_expect(d->tag != ~cur_inst, 0))
+			dec_fill(d, cur_inst);
+		d->fn(d);
+	}
+#else
 	if (cur_inst < 0x100000) {
 		value = (cur_inst >> 11) & (BITMASK(6) << 3);
 		value += (cur_inst >> 5) & BITMASK(3);
@@ -871,6 +1151,7 @@ void dsp56k_execute_instruction(void)
 		/* Do parallel move read */
 		opcodes_parmove[(cur_inst>>20) & BITMASK(4)]();
 	}
+#endif
 
 	/* Add the waitstate due to external memory access */
 	/* (2 extra cycles per extra access to the external memory after the first one */
@@ -892,11 +1173,21 @@ void dsp56k_execute_instruction(void)
 		dsp_core.agu_pipeline_reg[1] = 0;
 	}
 
-	/* Process the PC */
-	dsp_postexecute_update_pc();
+	/* Process the PC (NeXT-Color soft DSP: the plain case inline) */
+	if (__builtin_expect(dsp_core.loop_rep == 0, 1) &&
+	    (!(dsp_core.registers[DSP_REG_SR] & (1<<DSP_SR_LF)) ||
+	     (uint16_t)(dsp_core.pc + cur_inst_len) != dsp_core.registers[DSP_REG_LA] + 1))
+		dsp_core.pc += cur_inst_len;
+	else
+		dsp_postexecute_update_pc();
 
-	/* Process Interrupts */
-	dsp_postexecute_interrupts();
+	/* Process Interrupts (NeXT-Color soft DSP: nothing pending, inline) */
+	if (__builtin_expect(dsp_core.loop_rep == 0 && dsp_core.interrupt_state != DSP_INTERRUPT_DISABLED &&
+	    !(dsp_core.interrupt_status & DSP_INTER_NMI_MASK) &&
+	    !(dsp_core.interrupt_status & dsp_core.interrupt_enable & dsp_core.interrupt_mask), 1))
+		;
+	else
+		dsp_postexecute_interrupts();
 
 
 	/* Disasm current instruction ? (trace mode only) */

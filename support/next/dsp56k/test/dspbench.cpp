@@ -18,6 +18,81 @@
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
+#include <signal.h>
+#include <sys/time.h>
+#include <ucontext.h>
+#if defined(__linux__)
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
+// PERF=1: hardware counters over the timed run (perf_event_open)
+#if defined(__linux__)
+static const struct { uint32_t type; uint64_t cfg; const char *name; } perf_ev[] = {
+	{PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, "cycles"},
+	{PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS, "instructions"},
+	{PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_MISSES, "branch-misses"},
+	{PERF_TYPE_HW_CACHE, PERF_COUNT_HW_CACHE_L1I | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16), "L1I-misses"},
+	{PERF_TYPE_HW_CACHE, PERF_COUNT_HW_CACHE_L1D | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16), "L1D-read-misses"},
+	{PERF_TYPE_HW_CACHE, PERF_COUNT_HW_CACHE_DTLB | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16), "dTLB-misses"},
+	{PERF_TYPE_HW_CACHE, PERF_COUNT_HW_CACHE_ITLB | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16), "iTLB-misses"},
+};
+static int perf_fd[8];
+static void perf_start(void)
+{
+	if (!getenv("PERF")) return;
+	for (unsigned i = 0; i < sizeof(perf_ev) / sizeof(perf_ev[0]); i++) {
+		struct perf_event_attr a; memset(&a, 0, sizeof(a));
+		a.size = sizeof(a); a.type = perf_ev[i].type; a.config = perf_ev[i].cfg;
+		perf_fd[i] = syscall(__NR_perf_event_open, &a, 0, -1, -1, 0);
+		if (perf_fd[i] < 0) perror(perf_ev[i].name);
+	}
+}
+static void perf_stop(long n)
+{
+	if (!getenv("PERF")) return;
+	for (unsigned i = 0; i < sizeof(perf_ev) / sizeof(perf_ev[0]); i++) {
+		uint64_t v = 0;
+		if (perf_fd[i] >= 0 && read(perf_fd[i], &v, 8) == 8) printf("  %-16s %12llu  %7.2f per DSP instruction\n", perf_ev[i].name, (unsigned long long)v, (double)v / n);
+		if (perf_fd[i] >= 0) close(perf_fd[i]);
+	}
+}
+#else
+static void perf_start(void) {}
+static void perf_stop(long) {}
+#endif
+
+// PCSAMPLE=file: SIGPROF PC histogram (raw "addr count" lines, for addr2line)
+static uint32_t *pcs_hist; static uintptr_t pcs_lo, pcs_n;
+extern "C" char __executable_start[], etext[];
+static void pcs_sig(int, siginfo_t *, void *uc)
+{
+#if defined(__arm__)
+	uintptr_t pc = ((ucontext_t *)uc)->uc_mcontext.arm_pc;
+#else
+	uintptr_t pc = 0; (void)uc;
+#endif
+	if (pc >= pcs_lo && pc < pcs_lo + pcs_n * 4) pcs_hist[(pc - pcs_lo) / 4]++;
+}
+static void pcs_start(void)
+{
+	if (!getenv("PCSAMPLE")) return;
+	pcs_lo = (uintptr_t)__executable_start; pcs_n = ((uintptr_t)etext - pcs_lo) / 4 + 1;
+	pcs_hist = (uint32_t *)calloc(pcs_n, 4);
+	struct sigaction sa; memset(&sa, 0, sizeof(sa)); sa.sa_sigaction = pcs_sig; sa.sa_flags = SA_SIGINFO | SA_RESTART;
+	sigaction(SIGPROF, &sa, 0);
+	struct itimerval it = {{0, 1000}, {0, 1000}}; setitimer(ITIMER_PROF, &it, 0);
+}
+static void pcs_stop(void)
+{
+	const char *f = getenv("PCSAMPLE");
+	if (!f || !pcs_hist) return;
+	struct itimerval it = {{0, 0}, {0, 0}}; setitimer(ITIMER_PROF, &it, 0);
+	FILE *o = fopen(f, "w");
+	for (uintptr_t i = 0; i < pcs_n; i++) if (pcs_hist[i]) fprintf(o, "%lx %u\n", (unsigned long)(pcs_lo + i * 4), pcs_hist[i]);
+	fclose(o);
+}
 extern "C" {
 #include "dsp_core.h"
 #include "dsp_cpu.h"
@@ -79,9 +154,11 @@ static int replay(const char *path, long n, int pc)
 	dsp_core.pc = pc >= 0 ? pc : h.pc;
 	dsp_core.running = 1;
 	for (int i = 0; i < 1000; i++) dsp56k_execute_instruction();
+	pcs_start(); perf_start();
 	double t0 = cpu_s();
 	for (long i = 0; i < n; i++) dsp56k_execute_instruction();
 	double t1 = cpu_s();
+	pcs_stop(); perf_stop(n);
 	printf("replay %s from %04x: %ld instr in %.3f s CPU = %5.2f MIPS  pc %04x\n", path, pc >= 0 ? pc : h.pc, n, t1 - t0,
 	       n / (t1 - t0) / 1e6, dsp_core.pc);
 	return 0;
@@ -117,9 +194,11 @@ int main(int argc, char **argv)
 		dsp_core_start(1, 1);
 		if (fir) load_fir();
 		for (int i = 0; i < 1000; i++) dsp56k_execute_instruction();
+		perf_start();
 		t0 = cpu_s();
 		for (; done < n; done++) dsp56k_execute_instruction();
 		t1 = cpu_s();
+		perf_stop(n);
 	}
 	printf("%-4s link %d: %ld instr in %.3f s CPU = %5.2f MIPS  pc %04x a %06x\n", k, link, done, t1 - t0,
 	       done / (t1 - t0) / 1e6, dsp_core.pc, dsp_core.registers[DSP_REG_A1]);
