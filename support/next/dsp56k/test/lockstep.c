@@ -17,7 +17,7 @@
 #define CORE(p) \
 	extern dsp_core_t p##dsp_core; \
 	void p##dsp_core_init(void (*)(int)); void p##dsp_core_reset(void); \
-	void p##dsp_core_config_ramext(uint32_t *, uint32_t); void p##dsp56k_execute_instruction(void);
+	void p##dsp_core_config_ramext(uint32_t *, uint32_t); void p##dsp56k_execute_instruction(void); int p##dsp56k_jit_step(uint32_t *); void p##dsp56k_jit_flush(void);
 CORE(ref_)
 CORE(new_)
 
@@ -61,13 +61,32 @@ static int cmp_state(uint32_t pc0, uint32_t inst)
 	return 1;
 }
 
+static int use_jit;	/* LOCKSTEP_JIT=1: new core runs dsp56k_jit_step (blocks) */
+static long blocks, in_blocks;
+
 static int step(void)
 {
 	uint32_t pc0 = ref_dsp_core.pc;
 	uint32_t inst = pc0 < 0x200 ? ref_dsp_core.ramint[2][pc0] : ram_r[pc0 & 32767];
-	ref_dsp56k_execute_instruction();
-	new_dsp56k_execute_instruction();
-	steps++;
+	if (use_jit) {
+		uint32_t cn = 0, cr = 0;
+		int k = new_dsp56k_jit_step(&cn);
+		static uint32_t lp[64], lw[64], lc[64];
+		for (int i = 0; i < k; i++) {
+			uint32_t p = ref_dsp_core.pc;
+			if (i < 64) { lp[i] = p; lw[i] = p < 0x200 ? ref_dsp_core.ramint[2][p] : ram_r[p & 32767]; }
+			ref_dsp56k_execute_instruction(); cr += ref_dsp_core.instr_cycle;
+			if (i < 64) lc[i] = ref_dsp_core.instr_cycle;
+		}
+		if (cn != cr) for (int i = 0; i < k && i < 64; i++) printf("  ref %04x %06x %u cycles\n", lp[i], lw[i], lc[i]);
+		steps += k;
+		if (k > 1) { blocks++; in_blocks += k; }
+		if (cn != cr) { printf("CYCLES MISMATCH at step %ld (block of %d from %04x): ref %u new %u\n", steps, k, pc0, cr, cn); fails++; return 1; }
+	} else {
+		ref_dsp56k_execute_instruction();
+		new_dsp56k_execute_instruction();
+		steps++;
+	}
 	if (cmp_state(pc0, inst)) return 1;
 	if (!(steps & 63)) cmp_mem();
 	return fails > 0;
@@ -109,6 +128,7 @@ static int fuzz(long rounds)
 		uint32_t *keep = new_dsp_core.ramext;
 		memcpy(&new_dsp_core, &ref_dsp_core, sizeof new_dsp_core);
 		new_dsp_core.ramext = keep;
+		new_dsp56k_jit_flush();
 		for (int k = 0; k < 400; k++) {
 			if (step()) return 1;
 			if (ref_dsp_core.pc >= 0x200) { ref_dsp_core.pc &= 0x1ff; new_dsp_core.pc &= 0x1ff; }
@@ -156,14 +176,17 @@ static int replay(const char *path, long n, int pc)
 	uint32_t *keep = new_dsp_core.ramext;
 	memcpy(&new_dsp_core, &ref_dsp_core, sizeof new_dsp_core);
 	new_dsp_core.ramext = keep;
+	new_dsp56k_jit_flush();
 	for (long i = 0; i < n; i++) if (step()) return 1;
 	cmp_mem();
+	if (use_jit) printf("jit: %ld blocks of more than 1, %ld instructions in them\n", blocks, in_blocks);
 	printf("replay %s from %04x: %ld instructions, %s (pc %04x)\n", path, pc >= 0 ? pc : h.pc, steps, fails ? "MISMATCH" : "no mismatch", ref_dsp_core.pc);
 	return fails > 0;
 }
 
 int main(int argc, char **argv)
 {
+	use_jit = getenv("LOCKSTEP_JIT") != NULL;
 	if (argc > 3 && !strcmp(argv[1], "fuzz")) { s = strtoull(argv[2], 0, 0) | 1; return fuzz(atol(argv[3])); }
 	if (argc > 3 && !strcmp(argv[1], "replay")) return replay(argv[2], atol(argv[3]), argc > 4 ? (int)strtol(argv[4], 0, 16) : -1);
 	printf("usage: lockstep fuzz SEED ROUNDS | replay DUMP N [pc]\n");

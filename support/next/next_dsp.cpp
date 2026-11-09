@@ -830,13 +830,20 @@ static int link_step(int n)
 	service();
 
 	slice_break = 0;
+	int last_poll = 0;
 	while (done < n && dsp_core.running && pend_n < PENDQ_N / 2)
 	{
-		if (prof_on) prof_execute();
-		else dsp56k_execute_instruction();
-		step_cycles += dsp_core.instr_cycle;
-		done++;
-		instrs++;
+		int k = 1;
+		if (prof_on) { prof_execute(); step_cycles += dsp_core.instr_cycle; }
+		else
+		{
+			// one compiled block (dsp_jit.inc), or one instruction
+			uint32_t c = 0;
+			k = dsp56k_jit_step(&c);
+			step_cycles += c;
+		}
+		done += k;
+		instrs += k;
 		if (link_busy()) service();
 		// publish at once: the FPGA sees D2H messages (and our H2D read
 		// index) only through the ARM word, so a word sent mid-slice would
@@ -847,8 +854,9 @@ static int link_step(int n)
 		// out.  The credits come back as T_RXACK, seen only when the ring is
 		// polled, so poll it every STARVED_POLL instructions instead of once
 		// a slice (the window is DSPLINK_DEPTH words per round trip)
-		if (!(done & (STARVED_POLL - 1)) && rx_out >= rx_depth && (isr() & (1 << CPU_HOST_ISR_RXDF)))
+		if (done - last_poll >= STARVED_POLL && rx_out >= rx_depth && (isr() & (1 << CPU_HOST_ISR_RXDF)))
 		{
+			last_poll = done;
 			starved_polls++;
 			fpga_word();
 			if (f_h2d_wr != h2d_rd) { h2d_poll(); service(); if (arm_dirty) arm_word(); }

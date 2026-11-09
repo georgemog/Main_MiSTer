@@ -112,6 +112,11 @@ extern "C" {
 /* Functions */
 extern void dsp56k_init_cpu(void);		/* Set dsp_core to use */
 extern void dsp56k_execute_instruction(void);	/* Execute 1 instruction */
+/* NeXT-Color soft DSP: one compiled block, or one instruction; returns the
+   instructions run, adds their cycles to *cycles (dsp_jit.inc) */
+extern int dsp56k_jit_step(uint32_t *cycles);
+extern uint32_t dsp_jit_stats[8];
+extern void dsp56k_jit_flush(void);	/* after writing memory directly */
 extern uint16_t dsp56k_execute_one_disasm_instruction(FILE *out, uint16_t pc);	/* Execute 1 instruction in disasm mode */
 
 /* Interrupt relative functions */

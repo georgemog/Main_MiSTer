@@ -173,6 +173,13 @@ static uint32_t cur_inst;
 /* Counts the number of access to the external memory for one instruction */
 static uint16_t access_to_ext_memory;
 
+/* NeXT-Color soft DSP (dsp_jit.inc): a peripheral was read or written, an
+   external RAM word was written */
+static int jit_periph, jit_extw;
+/* code versions per 64-word page: external RAM index and internal P RAM
+   (bumped on writes; dsp_jit.inc blocks check theirs on entry) */
+static uint32_t jit_pver[65536 / 64], jit_iver[0x200 / 64];
+
 /* DSP is in disasm mode ? */
 /* If yes, stack overflow, underflow and illegal instructions messages are not displayed */
 static bool isDsp_in_disasm_mode;
@@ -1671,6 +1678,7 @@ static uint32_t read_memory(int space, uint16_t address)
 
 	/* Peripheral address ? */
 	if (address >= 0xffc0) {
+		jit_periph = 1;
 		value = dsp_core.periph[space][address-0xffc0] & BITMASK(24);
 		if (space == DSP_SPACE_X) {
 			if (address == 0xffc0+DSP_HOST_HRX) {
@@ -1719,6 +1727,7 @@ static void write_memory_raw(int space, uint16_t address, uint32_t value)
 
 	/* Peripheral address ? */
 	if (address >= 0xffc0) {
+		jit_periph = 1;
 		if (space == DSP_SPACE_X) {
 			switch(address-0xffc0) {
 				case DSP_HOST_HTX:
@@ -1789,6 +1798,7 @@ static void write_memory_raw(int space, uint16_t address, uint32_t value)
 	/* Internal RAM ? */
 	if (address < 0x100) {
 		dsp_core.ramint[space][address] = value;
+		if (space == DSP_SPACE_P) jit_iver[address >> 6]++;
 		return;
 	}
 
@@ -1803,6 +1813,7 @@ static void write_memory_raw(int space, uint16_t address, uint32_t value)
 		else {
 			/* Space P RAM */
 			dsp_core.ramint[DSP_SPACE_P][address] = value;
+			jit_iver[address >> 6]++;
 			return;
 		}
 	}
@@ -1824,6 +1835,8 @@ static void write_memory_raw(int space, uint16_t address, uint32_t value)
 		
 		/* Mask address to available RAM size */
 		dsp_core.ramext[address & (DSP_RAMSIZE-1)] = value;
+		jit_extw = 1;
+		jit_pver[(address & (DSP_RAMSIZE-1)) >> 6]++;
 	}
 }
 
@@ -9374,3 +9387,6 @@ static void dsp_tst_b(void)
 /*
 vim:ts=4:sw=4:
 */
+
+/* NeXT-Color soft DSP: block compiler (JIT plan phase 2) */
+#include "dsp_jit.inc"

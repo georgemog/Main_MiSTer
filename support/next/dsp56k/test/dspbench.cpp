@@ -99,6 +99,7 @@ extern "C" {
 }
 #include "next_dsp.h"
 
+static int jit_on() { const char *e = getenv("JIT"); return e && *e == '1'; }
 static double cpu_s() { timespec t; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static void hi(int) {}
 static uint64_t mb[0x4000 / 8];
@@ -156,9 +157,11 @@ static int replay(const char *path, long n, int pc)
 	for (int i = 0; i < 1000; i++) dsp56k_execute_instruction();
 	pcs_start(); perf_start();
 	double t0 = cpu_s();
-	for (long i = 0; i < n; i++) dsp56k_execute_instruction();
+	if (jit_on()) { uint32_t c = 0; for (long i = 0; i < n; ) i += dsp56k_jit_step(&c); }
+	else for (long i = 0; i < n; i++) dsp56k_execute_instruction();
 	double t1 = cpu_s();
 	pcs_stop(); perf_stop(n);
+	if (jit_on()) printf("jit: %u blocks, %u instructions in blocks, %u interpreted, %u compiles (other start %u, changed %u, LA inside %u, clip %u)\n", dsp_jit_stats[0], dsp_jit_stats[1], dsp_jit_stats[2], dsp_jit_stats[3], dsp_jit_stats[4], dsp_jit_stats[5], dsp_jit_stats[6], dsp_jit_stats[7]);
 	printf("replay %s from %04x: %ld instr in %.3f s CPU = %5.2f MIPS  pc %04x\n", path, pc >= 0 ? pc : h.pc, n, t1 - t0,
 	       n / (t1 - t0) / 1e6, dsp_core.pc);
 	return 0;
@@ -196,7 +199,8 @@ int main(int argc, char **argv)
 		for (int i = 0; i < 1000; i++) dsp56k_execute_instruction();
 		perf_start();
 		t0 = cpu_s();
-		for (; done < n; done++) dsp56k_execute_instruction();
+		if (jit_on()) { uint32_t c = 0; while (done < n) done += dsp56k_jit_step(&c); }
+		else for (; done < n; done++) dsp56k_execute_instruction();
 		t1 = cpu_s();
 		perf_stop(n);
 	}
