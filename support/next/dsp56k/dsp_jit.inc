@@ -1390,7 +1390,7 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 	int8_t lend[JIT_MAX];
 	uint32_t iw[JIT_MAX], iw2[JIT_MAX];
 	uint32_t a = pc, cur_clip = clip, outer_clip = clip;
-	int n = 0, i, ext_code, loop_open = -1, jumps_ok = !lf, has_jump = 0;
+	int n = 0, i, ext_code, loop_open = -1, jumps_ok = !lf, has_jump = 0, eagu_c = 0;
 
 	if (jit_pool_n >= JIT_POOL || jit_ptr + 64 * 1024 > jit_mem + JIT_CODE_SIZE)
 		jit_flush();
@@ -1482,7 +1482,14 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 		a += len;
 	}
 	if (n && ik[n - 1] == K_REP) n--;	/* (cut off before its instruction) */
-	if (eagu && n && ik[0] != K_NAT) n = 0;	/* (the delay is resolved at compile time) */
+	/* a pending AGU delay at entry: a native first instruction resolves it
+	   at compile time (R/N only: native addressing uses the M snapshot);
+	   Hatari's handler (jit_interp/jit_tail) takes it as it is */
+	if (eagu && n) {
+		int cfirst = ik[0] == K_INT || ik[0] == K_REP || ik[0] == K_DO || ik[0] == K_TAIL;
+		if (!cfirst && (eagu < DSP_REG_R0 || eagu > DSP_REG_N7)) n = 0;
+		if (n == 1 && ik[0] == K_TAIL) n = 0;
+	}
 	/* a lone tail is cheaper through the interpreter (a polling loop) */
 	if (n == 1 && ik[0] == K_TAIL) n = 0;
 	b->n = n;
@@ -1521,13 +1528,23 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 	ldr(R8, R4, offsetof(dsp_core_t, ramext));
 	dpi(AL, OP_MOV, 0, R5, 0, 0);
 	str(R5, SP, S_CNT);
-	if (eagu) {
+	if (eagu && (ik[0] == K_INT || ik[0] == K_REP || ik[0] == K_DO || ik[0] == K_TAIL)) {
+		/* stage it as if the previous instruction had just made it, for
+		   the handler's own pipeline step: [1] = [0], [0] = 0 */
+		ldrh_core(R0, offsetof(dsp_core_t, agu_pipeline_reg[0]));
+		strh_core(R0, offsetof(dsp_core_t, agu_pipeline_reg[1]));
+		ldrh_core(R0, offsetof(dsp_core_t, agu_pipeline_val[0]));
+		strh_core(R0, offsetof(dsp_core_t, agu_pipeline_val[1]));
+		dpi(AL, OP_MOV, 0, R0, 0, 0);
+		strh_core(R0, offsetof(dsp_core_t, agu_pipeline_reg[0]));
+		eagu_c = 1;
+	} else if (eagu) {
 		ldrh_core(R0, offsetof(dsp_core_t, agu_pipeline_val[0]));
 		str(R0, SP, S_AGUV);
 	}
 	body = ep;
 
-	jit_prev_agu = eagu;
+	jit_prev_agu = eagu_c ? 0 : eagu;
 	for (i = 0; i < n; i++) {
 		int lz = 0;
 		lbl[i] = ep;
@@ -1564,7 +1581,7 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 				   the interpreter's next end of instruction) */
 				dpi(AL, OP_MOV, 0, R0, 0, 0);
 				strh_core(R0, offsetof(dsp_core_t, agu_pipeline_reg[1]));
-				if (i == 0 && eagu) strh_core(R0, offsetof(dsp_core_t, agu_pipeline_reg[0]));
+				if (i == 0 && eagu && !eagu_c) strh_core(R0, offsetof(dsp_core_t, agu_pipeline_reg[0]));
 				ldr(R0, SP, S_AGUV);
 				strh_core(R0, offsetof(dsp_core_t, agu_pipeline_val[0]));
 			}
@@ -1812,7 +1829,7 @@ int dsp56k_jit_step(uint32_t *cycles)
 	eagu = dsp_core.agu_pipeline_reg[0];
 	if (jit_off || dsp_core.loop_rep || dsp_core.mode_wait ||
 	    dsp_core.interrupt_state == DSP_INTERRUPT_DISABLED ||
-	    (eagu && (eagu < DSP_REG_R0 || eagu > DSP_REG_N7 || dsp_core.agu_pipeline_reg[1])) ||
+	    (eagu && (eagu < DSP_REG_R0 || eagu > DSP_REG_M7 || dsp_core.agu_pipeline_reg[1])) ||
 	    (dsp_core.registers[DSP_REG_SR] & (1<<DSP_SR_T)) ||
 	    /* an interrupt pending (raised by the host link since the last
 	       check): the interpreter takes it after one instruction */
