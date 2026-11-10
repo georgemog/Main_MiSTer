@@ -24,6 +24,16 @@
       ./lockstep replay DUMP 10000000 40   # a next_dsp profile dump from pc
 
   An injected sign-extension bug in a parallel move shows at step 4.
+
+  Dumps that exercise the JIT (mister2, /media/usb0/next_dsp/bench/):
+  cov.bin, scale.bin and cov_t30.bin from pc 40 (Music Kit orchestra
+  loops), pach_t40.bin from pc 40 (Pachelbel's orchestra) and from its own
+  pc, cov_t15.bin from its own pc (a host polling loop), mulaw.bin (host
+  polling, interpreted).  A dump is taken by writing a label to
+  /media/usb0/next_dsp/dump while a score plays (no profiling needed); one
+  taken in a score's first ~15 s is usually still in the bootstrap ROM (pc
+  0017) and runs no JIT code: check `JIT=1 dspbench replay` reports blocks.
+  pach_hang.bin is the DSP at Pachelbel's hang (in the bootstrap ROM).
 - `dspbench` extras: `PERF=1` prints A9 hardware counters (cycles, ARM
   instructions, branch/cache/TLB misses per DSP instruction; the A9 PMU
   needs kernel counting on, so it is not excluded); `PCSAMPLE=file` writes a
