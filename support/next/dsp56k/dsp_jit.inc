@@ -38,6 +38,14 @@
  * (jit_tail), so jumps, bit tests, movep, do and so on no longer need the
  * interpreter's full dispatch.
  *
+ * Step 4: DO #n / DO S runs inside the block (Hatari's handler) and its
+ * body follows inline; at LA the block branches back while LC > 1 (with a
+ * budget) and pops the loop (jit_loopend) at LC = 1, then goes on.  With
+ * no loop active, JMP (short and absolute) continues the block at its
+ * target, a JMP or Jcc to the block's start loops in place, and a taken
+ * Jcc exits.  Such blocks keep up to JIT_PV code pages and JIT_NR
+ * external code ranges, and are only entered with LF clear.
+ *
  * Code changes: a block keeps the P words it was compiled from and checks
  * them on entry.  Changing the external RAM (pointer or size) drops all.
  */
@@ -61,6 +69,8 @@
 #define JIT_MAX		32		/* instructions per block */
 #define JIT_CODE_SIZE	(2 << 20)
 #define JIT_HASH	65536		/* one slot per P address */
+#define JIT_PV		8		/* code pages per block */
+#define JIT_NR		3		/* external code ranges per block */
 
 typedef struct jit_block_s {
 	uint16_t start, last;		/* first and last instruction address */
@@ -68,8 +78,10 @@ typedef struct jit_block_s {
 	uint16_t clip;			/* compiled to stop at this LA (0xffff: none) */
 	uint16_t nw;			/* P words */
 	uint16_t scal;			/* SR scaling bits it was compiled for */
-	const uint32_t *pv[3];		/* code version counters of its pages */
-	uint32_t ver[3];
+	uint8_t npv;			/* code pages */
+	uint8_t jumps;			/* follows jumps: only entered with no loop active */
+	const uint32_t *pv[JIT_PV];	/* code version counters of its pages */
+	uint32_t ver[JIT_PV];
 	void (*code)(void);
 	const uint32_t *src[2 * JIT_MAX];	/* where each P word came from */
 	uint32_t word[2 * JIT_MAX];
@@ -157,7 +169,8 @@ enum { OP_AND = 0, OP_EOR, OP_SUB, OP_RSB, OP_ADD, OP_ADC, OP_SBC, OP_RSC,
        OP_TST, OP_TEQ, OP_CMP, OP_CMN, OP_ORR, OP_MOV, OP_BIC, OP_MVN };
 
 static uint32_t *ep;			/* emit pointer */
-static uint32_t jit_lo, jit_hi;		/* external RAM index range of the block's code (lo > hi: none) */
+static uint32_t jit_rlo[JIT_NR], jit_rhi[JIT_NR];	/* external RAM index ranges of the block's code */
+static int jit_nrange;
 static uint32_t *ep_end;
 static int ep_overflow;
 
@@ -396,14 +409,13 @@ static void gen_write(int space)
 		ldr_x(R0, R3, R1);
 		dpi(AL, OP_ADD, 0, R0, R0, 1);
 		str_x(R0, R3, R1);
-		if (jit_lo <= jit_hi) {
-			cmpi(R11, jit_lo);
-			{
-				uint32_t *below = bcc(LO);
-				cmpi(R11, jit_hi);
-				dpi(LS, OP_ORR, 0, R9, R9, JF_SMC);
-				patch(below, ep);
-			}
+		for (int r = 0; r < jit_nrange; r++) {
+			uint32_t *below;
+			cmpi(R11, jit_rlo[r]);
+			below = bcc(LO);
+			cmpi(R11, jit_rhi[r]);
+			dpi(LS, OP_ORR, 0, R9, R9, JF_SMC);
+			patch(below, ep);
 		}
 		done2 = bcc(AL);
 	}
@@ -828,7 +840,7 @@ static void gen_inst(uint32_t inst)
    (a move to R/N/M) ends the block too: the next instruction must see it. */
 static uint32_t jit_interp(uint32_t inst, uint32_t addr)
 {
-	uint32_t value, f = 0;
+	uint32_t value, f = 0, is = dsp_core.interrupt_status;
 
 	dsp_core.pc = addr;
 	cur_inst = inst;
@@ -856,7 +868,7 @@ static uint32_t jit_interp(uint32_t inst, uint32_t addr)
 		if (value > 1)
 			dsp_core.instr_cycle += (value - 1) * 2;
 	}
-	if (jit_periph || dsp_core.agu_pipeline_reg[1]) f |= JF_PERIPH;
+	if (jit_periph || dsp_core.agu_pipeline_reg[1] || dsp_core.interrupt_status != is) f |= JF_PERIPH;
 	if (jit_extw) f |= JF_SMC;
 	dsp_core.agu_pipeline_reg[0] = 0;
 	return dsp_core.instr_cycle | f << 16;
@@ -969,16 +981,124 @@ static int jit_init(void)
 	return 0;
 }
 
-static jit_block_t *jit_compile(uint16_t pc, uint16_t clip)
+/* control instructions compiled into blocks (step 4) */
+enum { K_END = 0, K_NAT = 1, K_INT = 2, K_TAIL = 3, K_DO = 4, K_JMP = 5, K_JCC = 6 };
+
+/* a jump, Jcc or DO the compiler handles: kind, target (DO: LA), words,
+   cycles; 0 for anything else */
+static int jit_ctl(uint32_t inst, uint32_t a, uint32_t *tgt, int *len, int *cyc, int *cc)
+{
+	dsp_emul_t f;
+	const uint32_t *s2;
+	if (inst >= 0x100000) return 0;
+	f = opcodes8h[((inst >> 11) & (BITMASK(6) << 3)) + ((inst >> 5) & BITMASK(3))];
+	if (f == dsp_jmp_imm || f == dsp_jcc_imm) {
+		*tgt = inst & BITMASK(12); *len = 1; *cyc = 4; *cc = (inst >> 12) & 15;
+		return f == dsp_jmp_imm ? K_JMP : K_JCC;
+	}
+	if (a >= 0xffff || !(s2 = jit_psrc(a + 1))) return 0;
+	if ((f == dsp_jmp_ea || f == dsp_jcc_ea) && ((inst >> 8) & 0x3f) == 0x30) {	/* absolute */
+		*tgt = *s2 & 0xffff; *len = 2; *cyc = 6; *cc = inst & 15;
+		return f == dsp_jmp_ea ? K_JMP : K_JCC;
+	}
+	if (f == dsp_do_imm || f == dsp_do_reg) {
+		*tgt = *s2 & 0xffff; *len = 2; *cyc = 6;
+		return K_DO;
+	}
+	return 0;
+}
+
+/* the block's code pages (versions) and external RAM ranges (self-modification) */
+static const uint32_t *jit_npv_p[JIT_PV];
+static int jit_npv;
+static int jit_nr;
+static uint32_t jit_rf[JIT_NR], jit_rl[JIT_NR];	/* address ranges of external code */
+
+/* add the pages of P words f..l; 0 (nothing added) when full */
+static int jit_add_pages(uint32_t f, uint32_t l)
+{
+	const uint32_t *p[2] = { jit_pver_of(f), jit_pver_of(l) };
+	int add = 0, i, j;
+	for (j = 0; j < 2; j++) {
+		int have = 0;
+		for (i = 0; i < jit_npv; i++) if (jit_npv_p[i] == p[j]) have = 1;
+		if (j == 1 && p[1] == p[0]) have = 1;
+		if (!have) add++;
+	}
+	if (jit_npv + add > JIT_PV) return 0;
+	for (j = 0; j < 2; j++) {
+		int have = 0;
+		for (i = 0; i < jit_npv; i++) if (jit_npv_p[i] == p[j]) have = 1;
+		if (!have) jit_npv_p[jit_npv++] = p[j];
+	}
+	return 1;
+}
+
+/* add P words f..l to the external code ranges; 0 when full */
+static int jit_add_range(uint32_t f, uint32_t l)
+{
+	if (l < 0x200 || !jit_ramext) return 1;
+	if (f < 0x200) f = 0x200;
+	if (jit_nr && f == jit_rl[jit_nr - 1] + 1) { jit_rl[jit_nr - 1] = l; return 1; }
+	if (jit_nr && f >= jit_rf[jit_nr - 1] && l <= jit_rl[jit_nr - 1]) return 1;
+	if (jit_nr == JIT_NR) return 0;
+	jit_rf[jit_nr] = f; jit_rl[jit_nr] = l; jit_nr++;
+	return 1;
+}
+
+/* exit requests: a branch to a stub that returns count, pc, len */
+static struct { uint32_t *br; uint16_t cnt, pc, len; } jit_xr[4 * JIT_MAX];
+static int jit_nxr;
+
+static void exit_if(int cond, int cnt, uint32_t xpc, uint32_t xlen)
+{
+	if (jit_nxr >= 4 * JIT_MAX) { ep_overflow = 1; return; }
+	jit_xr[jit_nxr].br = bcc(cond);
+	jit_xr[jit_nxr].cnt = cnt; jit_xr[jit_nxr].pc = xpc; jit_xr[jit_nxr].len = xlen;
+	jit_nxr++;
+}
+
+/* S_CNT += cnt; on to target unless the budget is spent (then exit as given) */
+static void gen_back(uint32_t *target, int cnt, int xcnt, uint32_t xpc, uint32_t xlen)
+{
+	ldr(R2, SP, S_CNT);
+	opi(OP_ADD, R2, R2, cnt);
+	cmpi(R2, JIT_LOOP_BUDGET);
+	exit_if(HS, xcnt, xpc, xlen);
+	str(R2, SP, S_CNT);
+	bto(AL, target);
+}
+
+/* the end of an inline DO loop with LC = 1 (dsp_postexecute_update_pc) */
+static void jit_loopend(void)
+{
+	uint32_t saved_pc, saved_sr;
+	dsp_stack_pop(&saved_pc, &saved_sr);
+	dsp_core.registers[DSP_REG_SR] &= 0x7fff;
+	dsp_core.registers[DSP_REG_SR] |= saved_sr & (1<<DSP_SR_LF);
+	dsp_stack_pop(&dsp_core.registers[DSP_REG_LA], &dsp_core.registers[DSP_REG_LC]);
+}
+
+static void gen_cc(uint32_t cc)
+{
+	ldr(R0, R4, OFF_REG(DSP_REG_SR));
+	dpi(AL, OP_AND, 0, R0, R0, 0x7f);
+	mov32(IP, (uint32_t)(uintptr_t)jit_cc[cc & 15]);
+	ldrb_x(R0, IP, R0);
+	dpi(AL, OP_CMP, 1, 0, R0, 0);
+}
+
+static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf)
 {
 	jit_block_t *b;
-	uint32_t *exits[JIT_MAX], *start, *body, *to_end[4];
+	uint32_t *start, *body, *to_end[4], *lbl[JIT_MAX];
 	int nend = 0;
-	uint16_t ia[JIT_MAX];
-	uint8_t il[JIT_MAX], ik[JIT_MAX];
+	uint16_t ia[JIT_MAX], itg[JIT_MAX], epc[JIT_MAX], elen[JIT_MAX];
+	uint8_t il[JIT_MAX], ik[JIT_MAX], icy[JIT_MAX], iback[JIT_MAX], icc[JIT_MAX];
+	int8_t lend[JIT_MAX];
 	uint32_t iw[JIT_MAX];
-	uint32_t a = pc;
-	int n = 0, i, ext_code;
+	uint32_t a = pc, cur_clip = clip, outer_clip = clip;
+	int n = 0, i, ext_code, loop_open = -1, jumps_ok = !lf, has_jump = 0;
 
 	if (jit_pool_n >= JIT_POOL || jit_ptr + 64 * 1024 > jit_mem + JIT_CODE_SIZE)
 		jit_flush();
@@ -989,46 +1109,81 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip)
 	b->nw = 0;
 	b->scal = jit_scal = (dsp_core.registers[DSP_REG_SR] >> DSP_SR_S0) & 3;
 	dsp_jit_stats[3]++;
+	jit_npv = 0;
+	jit_nr = 0;
+	jit_nxr = 0;
 
-	/* the run of instructions that stay in a block */
+	/* the instructions that stay in a block: straight runs, an inline DO
+	   loop (body to LA, then on), and (no loop active) jumps followed to
+	   their target */
 	while (n < jit_max && a <= 0xfffe) {
-		const uint32_t *s = jit_psrc(a), *s2 = NULL;
-		uint32_t w;
-		int k, len;
+		const uint32_t *s = jit_psrc(a);
+		uint32_t w, tgt = 0;
+		int k, len = 1, cyc = 2, cc = 0;
 		if (!s) break;
 		w = *s & BITMASK(24);
 		k = jit_kind(w);
+		if (k == K_TAIL) {
+			int c = jit_ctl(w, a, &tgt, &len, &cyc, &cc);
+			if (c == K_DO && !(loop_open < 0 && tgt >= a + 2 && (cur_clip == 0xffff || tgt < cur_clip) &&
+			                   !(cur_clip >= a && cur_clip <= a + 1)))
+				c = 0;
+			if ((c == K_JMP || c == K_JCC) && !(jumps_ok && loop_open < 0 && cur_clip == 0xffff))
+				c = 0;
+			if (c) k = c;
+			else len = 2;			/* a tail: count two words */
+		} else if (k) {
+			len = jit_len(w);
+			if (len == 2 && !jit_psrc(a + 1)) break;
+		}
 		if (!k) break;
-		if (k == 3) {
-			/* a tail: its length is the handler's; count two words for
-			   the code pages and the self-modification range */
-			ia[n] = a; il[n] = 2; ik[n] = k; iw[n] = w;
-			b->src[b->nw] = s; b->word[b->nw++] = w;
-			n++;
+		if (!jit_add_pages(a, a + len - 1)) break;
+		if (!jit_add_range(a, a + len - 1)) break;
+		ia[n] = a; il[n] = len; ik[n] = k; iw[n] = w; itg[n] = tgt; icy[n] = cyc;
+		iback[n] = 0; lend[n] = -1; icc[n] = cc;
+		epc[n] = a; elen[n] = len;
+		n++;
+		if (k == K_TAIL) break;
+		if (k == K_DO) {
+			loop_open = n;
+			outer_clip = cur_clip; cur_clip = tgt;
+			a += 2;
+			continue;
+		}
+		if (k == K_JMP) {
+			has_jump = 1;
+			epc[n - 1] = tgt; elen[n - 1] = 0;
+			if (tgt == pc) { iback[n - 1] = 1; break; }
+			a = tgt;
+			continue;
+		}
+		if (k == K_JCC) {
+			has_jump = 1;
+			if (tgt == pc) iback[n - 1] = 1;
+			a += len;
+			continue;
+		}
+		if (cur_clip >= a && cur_clip < a + len) {
+			if (loop_open >= 0 && loop_open < n && cur_clip == a + len - 1) {
+				/* the inline loop's last instruction */
+				lend[n - 1] = loop_open;
+				loop_open = -1;
+				cur_clip = outer_clip;
+				a += len;
+				continue;
+			}
 			break;
 		}
-		len = jit_len(w);
-		if (len == 2 && !(s2 = jit_psrc(a + 1))) break;
-		b->src[b->nw] = s; b->word[b->nw++] = w;
-		if (s2) { b->src[b->nw] = s2; b->word[b->nw++] = *s2 & BITMASK(24); }
-		ia[n] = a; il[n] = len; ik[n] = k; iw[n] = w;
-		n++;
-		if (clip >= a && clip < a + len) break;
 		a += len;
 	}
 	/* a lone tail is cheaper through the interpreter (a polling loop) */
-	if (n == 1 && ik[0] == 3) n = 0;
+	if (n == 1 && ik[0] == K_TAIL) n = 0;
 	b->n = n;
 	b->last = n ? ia[n - 1] : pc;
-	/* pages: the first word's, the last instruction's and the last word's
-	   (the words up to the last instruction span at most two) */
-	{
-		uint32_t endw = n ? ia[n - 1] + il[n - 1] - 1 : pc;
-		b->pv[0] = jit_pver_of(pc);
-		b->pv[1] = jit_pver_of(n ? ia[n - 1] : pc);
-		b->pv[2] = jit_pver_of(endw);
-		for (i = 0; i < 3; i++) b->ver[i] = *b->pv[i];
-	}
+	b->jumps = has_jump;
+	if (!n) { jit_npv = 0; jit_add_pages(pc, pc); }
+	b->npv = jit_npv;
+	for (i = 0; i < jit_npv; i++) { b->pv[i] = jit_npv_p[i]; b->ver[i] = *b->pv[i]; }
 	if (!n) {
 		const uint32_t *s = jit_psrc(pc);
 		b->src[0] = s;
@@ -1037,15 +1192,15 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip)
 		return b;
 	}
 
-	/* external RAM indices of the block's code */
-	jit_lo = 1; jit_hi = 0;
-	ext_code = jit_ramext && ia[n - 1] + il[n - 1] - 1 >= 0x200;	/* (a word in external RAM) */
-	if (ext_code) {
-		uint32_t f = pc < 0x200 ? 0x200 : pc, l = ia[n - 1] + il[n - 1] - 1;
-		jit_lo = f & (jit_ramsize - 1);
-		jit_hi = l & (jit_ramsize - 1);
-		if (jit_hi < jit_lo) { jit_lo = 0; jit_hi = jit_ramsize - 1; }
+	/* external RAM index ranges of the block's code */
+	ext_code = jit_nr > 0;
+	for (i = 0; i < jit_nr; i++) {
+		jit_rlo[i] = jit_rf[i] & (jit_ramsize - 1);
+		jit_rhi[i] = jit_rl[i] & (jit_ramsize - 1);
+		if (jit_rhi[i] < jit_rlo[i] || jit_rl[i] - jit_rf[i] >= jit_ramsize) { jit_rlo[i] = 0; jit_rhi[i] = jit_ramsize - 1; }
 	}
+	jit_nrange = jit_nr;
+
 	ep = start = (uint32_t *)jit_ptr;
 	ep_end = (uint32_t *)(jit_mem + JIT_CODE_SIZE);
 	ep_overflow = 0;
@@ -1061,8 +1216,9 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip)
 
 	jit_prev_agu = 0;
 	for (i = 0; i < n; i++) {
+		lbl[i] = ep;
 		jit_cur_agu = 0;
-		if (ik[i] == 3) {
+		if (ik[i] == K_TAIL) {
 			/* the tail: Hatari's handler; falls through to the end with
 			   the PC and length it left in jit_out */
 			mov32(R0, iw[i]);
@@ -1070,11 +1226,10 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip)
 			call((const void *)jit_tail);
 			dpr(AL, OP_MOV, 0, R10, 0, R0, 0, 0);
 			dpr(AL, OP_ADD, 0, R5, R5, R10, 0, 0);
-			exits[i] = NULL;
 			jit_prev_agu = 0;
 			break;
 		}
-		if (ik[i] == 2) {
+		if (ik[i] == K_INT || ik[i] == K_DO) {
 			mov32(R0, iw[i]);
 			mov32(R1, ia[i]);
 			call((const void *)jit_interp);
@@ -1091,13 +1246,17 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip)
 				ldr(R0, SP, S_AGUV);
 				strh_core(R0, offsetof(dsp_core_t, agu_pipeline_val[0]));
 			}
-			dpi(AL, OP_MOV, 0, R9, 0, ia[i] >= 0x200 ? 4 : 0);	/* P fetch external */
-			gen_inst(iw[i]);
-			/* cycles: 2 + wait states */
-			dpi(AL, OP_AND, 0, R0, R9, 7);
-			mov32(IP, (uint32_t)(uintptr_t)jit_wait);
-			ldrb_x(R0, IP, R0);
-			dpi(AL, OP_ADD, 0, R10, R0, 2);
+			if (ik[i] == K_JMP || ik[i] == K_JCC) {
+				dpi(AL, OP_MOV, 0, R10, 0, icy[i]);
+			} else {
+				dpi(AL, OP_MOV, 0, R9, 0, ia[i] >= 0x200 ? 4 : 0);	/* P fetch external */
+				gen_inst(iw[i]);
+				/* cycles: 2 + wait states */
+				dpi(AL, OP_AND, 0, R0, R9, 7);
+				mov32(IP, (uint32_t)(uintptr_t)jit_wait);
+				ldrb_x(R0, IP, R0);
+				dpi(AL, OP_ADD, 0, R10, R0, 2);
+			}
 		}
 		dpr(AL, OP_ADD, 0, R5, R5, R10, 0, 0);
 		if (jit_dbg) {
@@ -1106,17 +1265,61 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip)
 			dpr(AL, OP_MOV, 0, R2, 0, R5, 0, 0);
 			call((const void *)jit_dbg_rec);
 		}
-		/* a peripheral or this block's code was touched, or an AGU delay is
-		   pending: end after this instruction */
+		if (ik[i] == K_JMP) {
+			jit_prev_agu = 0;
+			if (iback[i]) gen_back(body, i + 1, i + 1, epc[i], 0);
+			continue;
+		}
+		if (ik[i] == K_JCC) {
+			uint32_t *nt;
+			jit_prev_agu = 0;
+			gen_cc(icc[i]);
+			if (iback[i]) {
+				nt = bcc(EQ);
+				gen_back(body, i + 1, i + 1, itg[i], 0);
+				patch(nt, ep);
+			} else {
+				exit_if(NE, i + 1, itg[i], 0);
+			}
+			continue;
+		}
+		/* a peripheral or this block's code was touched, an AGU delay is
+		   pending, or an interrupt was raised: end after this instruction */
 		dpi(AL, OP_TST, 1, 0, R9, JF_EXIT);
-		exits[i] = bcc(NE);
-		jit_prev_agu = ik[i] == 1 ? jit_cur_agu : 0;
+		exit_if(NE, i + 1, epc[i], elen[i]);
+		jit_prev_agu = ik[i] == K_NAT ? jit_cur_agu : 0;
+		if (lend[i] >= 0) {
+			/* inline DO loop end at LA: again while LC > 1, else pop */
+			int ls = lend[i];
+			if (jit_prev_agu) {
+				exit_if(AL, i + 1, epc[i], elen[i]);
+				continue;
+			}
+			ldr(R0, R4, OFF_REG(DSP_REG_LC));
+			cmpi(R0, 1);
+			{
+				uint32_t *last = bcc(EQ);
+				dpi(AL, OP_SUB, 0, R0, R0, 1);
+				ubfx(R0, R0, 0, 16);
+				/* (LC is stored only when the pass is taken) */
+				ldr(R2, SP, S_CNT);
+				opi(OP_ADD, R2, R2, i - ls + 1);
+				cmpi(R2, JIT_LOOP_BUDGET);
+				exit_if(HS, i + 1, epc[i], elen[i]);
+				str(R2, SP, S_CNT);
+				str(R0, R4, OFF_REG(DSP_REG_LC));
+				bto(AL, lbl[ls]);
+				patch(last, ep);
+			}
+			call((const void *)jit_loopend);
+		}
 	}
 	/* the block is a DO loop's body, from its start (SSH) to LA: loop here
 	   while LC > 1, as dsp_postexecute_update_pc would, up to a budget (LF
 	   and LA were checked on entry; nothing in a block changes them, SSH or
 	   LC) */
-	if (clip != 0xffff && clip == ia[n - 1] + il[n - 1] - 1 && ik[n - 1] != 3 && !jit_prev_agu) {
+	if (clip != 0xffff && clip == ia[n - 1] + il[n - 1] - 1 && (ik[n - 1] == K_NAT || ik[n - 1] == K_INT) &&
+	    !jit_prev_agu && lend[n - 1] < 0) {
 		ldr(R0, R4, OFF_REG(DSP_REG_LC));
 		cmpi(R0, 1);
 		to_end[nend++] = bcc(EQ);
@@ -1133,32 +1336,32 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip)
 		str(R0, R4, OFF_REG(DSP_REG_LC));
 		bto(AL, body);
 	}
-	/* exits: r0 instructions run, r1 last instruction, r2 its words, r10
-	   its cycles */
+	/* exits: r0 instructions run, r1 pc and r2 length for jit_post, r10
+	   the last instruction's cycles */
 	{
-		uint32_t *to_epi[JIT_MAX + 1], *epi;
+		uint32_t *to_epi[4 * JIT_MAX + 1], *epi;
 		for (i = 0; i < nend; i++) patch(to_end[i], ep);
 		ldr(R0, SP, S_CNT);
 		opi(OP_ADD, R0, R0, n);
-		if (ik[n - 1] == 3) {
+		if (ik[n - 1] == K_TAIL) {
 			mov32(IP, (uint32_t)(uintptr_t)&jit_out);
 			ldr(R1, IP, 4);
 			ldr(R2, IP, 8);
 		} else {
-			mov32(R1, ia[n - 1]);
-			mov32(R2, il[n - 1]);
+			mov32(R1, epc[n - 1]);
+			mov32(R2, elen[n - 1]);
 		}
-		to_epi[n] = bcc(AL);
-		for (i = 0; i < n; i++) {
-			patch(exits[i], ep);
+		to_epi[jit_nxr] = bcc(AL);
+		for (i = 0; i < jit_nxr; i++) {
+			patch(jit_xr[i].br, ep);
 			ldr(R0, SP, S_CNT);
-			opi(OP_ADD, R0, R0, i + 1);
-			mov32(R1, ia[i]);
-			mov32(R2, il[i]);
+			opi(OP_ADD, R0, R0, jit_xr[i].cnt);
+			mov32(R1, jit_xr[i].pc);
+			mov32(R2, jit_xr[i].len);
 			to_epi[i] = bcc(AL);
 		}
 		epi = ep;
-		for (i = 0; i <= n; i++) patch(to_epi[i], epi);
+		for (i = 0; i <= jit_nxr; i++) patch(to_epi[i], epi);
 		/* epilogue: jit_out = {n, pc, len, cycles}; instr_cycle = r10 */
 		mov32(IP, (uint32_t)(uintptr_t)&jit_out);
 		str(R0, IP, 0);
@@ -1182,7 +1385,9 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip)
 
 static int jit_valid(const jit_block_t *b)
 {
-	return *b->pv[0] == b->ver[0] && *b->pv[1] == b->ver[1] && *b->pv[2] == b->ver[2];
+	for (int i = 0; i < b->npv; i++)
+		if (*b->pv[i] != b->ver[i]) return 0;
+	return 1;
 }
 
 /* drop every block (memory changed behind the core's back: tests) */
@@ -1248,9 +1453,10 @@ int dsp56k_jit_step(uint32_t *cycles)
 	if (!b || (b->start != pc && ++dsp_jit_stats[4]) || (!jit_valid(b) && ++dsp_jit_stats[5]) ||
 	    (b->n && lf && la >= b->start && la < b->last && ++dsp_jit_stats[6]) ||
 	    (b->clip != 0xffff && !(lf && la == b->clip) && ++dsp_jit_stats[7]) ||
-	    (b->scal != ((dsp_core.registers[DSP_REG_SR] >> DSP_SR_S0) & 3) && ++dsp_jit_stats[5])) {
+	    (b->scal != ((dsp_core.registers[DSP_REG_SR] >> DSP_SR_S0) & 3) && ++dsp_jit_stats[5]) ||
+	    (b->jumps && lf && ++dsp_jit_stats[7])) {
 		/* (a block clipped at an LA is kept only while that loop runs) */
-		b = jit_compile(pc, lf && la >= pc ? la : 0xffff);
+		b = jit_compile(pc, lf && la >= pc ? la : 0xffff, lf);
 		*slot = b;
 		if (!b) goto interp;
 	}
