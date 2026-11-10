@@ -155,12 +155,37 @@ static int replay(const char *path, long n, int pc)
 	dsp_core.pc = pc >= 0 ? pc : h.pc;
 	dsp_core.running = 1;
 	for (int i = 0; i < 1000; i++) dsp56k_execute_instruction();
+	if (getenv("JITHIST")) { dsp_jit_ihist = (uint32_t *)calloc(65536, 4); dsp_jit_khist = (uint32_t *)calloc(65536, 4); }
 	pcs_start(); perf_start();
 	double t0 = cpu_s();
 	if (jit_on()) { uint32_t c = 0; for (long i = 0; i < n; ) i += dsp56k_jit_step(&c); }
 	else for (long i = 0; i < n; i++) dsp56k_execute_instruction();
 	double t1 = cpu_s();
 	pcs_stop(); perf_stop(n);
+	if (jit_on() && dsp_jit_khist) {
+		uint64_t tot = 0;
+		for (uint32_t p = 0; p < 65536; p++) tot += dsp_jit_khist[p];
+		printf("  handlers in blocks: %llu\n", (unsigned long long)tot);
+		for (int t = 0; t < 8; t++) {
+			uint32_t best = 0, bp = 0;
+			for (uint32_t p = 0; p < 65536; p++) if (dsp_jit_khist[p] > best) { best = dsp_jit_khist[p]; bp = p; }
+			if (!best) break;
+			uint32_t w = bp < 0x200 ? dsp_core.ramint[DSP_SPACE_P][bp] : (dsp_core.ramext ? dsp_core.ramext[bp & (DSP_RAMSIZE - 1)] : 0);
+			printf("  handler p:%04x %06x %u\n", bp, w, best);
+			dsp_jit_khist[bp] = 0;
+		}
+	}
+	if (jit_on() && dsp_jit_ihist) {
+		/* JITHIST=1: the most interpreted PCs */
+		for (int t = 0; t < 12; t++) {
+			uint32_t best = 0, bp = 0;
+			for (uint32_t p = 0; p < 65536; p++) if (dsp_jit_ihist[p] > best) { best = dsp_jit_ihist[p]; bp = p; }
+			if (!best) break;
+			uint32_t w = bp < 0x200 ? dsp_core.ramint[DSP_SPACE_P][bp] : (dsp_core.ramext ? dsp_core.ramext[bp & (DSP_RAMSIZE - 1)] : 0);
+			printf("  interpreted p:%04x %06x %u\n", bp, w, best);
+			dsp_jit_ihist[bp] = 0;
+		}
+	}
 	if (jit_on()) printf("jit: %u blocks, %u instructions in blocks, %u interpreted, %u compiles (other start %u, changed %u, LA inside %u, clip %u)\n", dsp_jit_stats[0], dsp_jit_stats[1], dsp_jit_stats[2], dsp_jit_stats[3], dsp_jit_stats[4], dsp_jit_stats[5], dsp_jit_stats[6], dsp_jit_stats[7]);
 	printf("replay %s from %04x: %ld instr in %.3f s CPU = %5.2f MIPS  pc %04x\n", path, pc >= 0 ? pc : h.pc, n, t1 - t0,
 	       n / (t1 - t0) / 1e6, dsp_core.pc);
