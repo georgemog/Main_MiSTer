@@ -33,5 +33,6 @@
   interpreter, comparing state and cycles at each block end.  It must run on
   ARM: `CROSS=arm-none-linux-gnueabihf- ./lockstep.sh` on the build box,
   then run the binary on the MiSTer.  `NEXT_DSP_JIT_MAX=1` makes one-instruction
-  blocks (to find which instruction differs); `NEXT_DSP_JIT=0` turns the JIT off.
+  blocks (to find which instruction differs); `NEXT_DSP_JIT_ALU=0` calls Hatari for
+  every ALU op (to tell native ALU bugs from the rest); `NEXT_DSP_JIT=0` turns the JIT off.
   `dspbench`: `JIT=1` runs the kernels through the JIT.

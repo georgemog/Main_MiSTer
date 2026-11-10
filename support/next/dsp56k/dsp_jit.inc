@@ -26,6 +26,11 @@
  * Cycles: 2 per instruction plus Hatari's external-memory wait states,
  * computed per instruction.
  *
+ * Native ALU (step 2): MPY/MPYR/MAC/MACR, ADD/SUB/CMP (A/B, X, Y, X0..Y1),
+ * TFR, TST, CLR, RND with exact CCR, in scaling mode 0 (a block keeps the
+ * mode it was compiled for).  NEXT_DSP_JIT_ALU=0 calls Hatari's functions
+ * for every ALU op instead.
+ *
  * Code changes: a block keeps the P words it was compiled from and checks
  * them on entry.  Changing the external RAM (pointer or size) drops all.
  */
@@ -55,6 +60,7 @@ typedef struct jit_block_s {
 	uint16_t n;			/* instructions; 0: the first one ends blocks */
 	uint16_t clip;			/* compiled to stop at this LA (0xffff: none) */
 	uint16_t nw;			/* P words */
+	uint16_t scal;			/* SR scaling bits it was compiled for */
 	const uint32_t *pv[2];		/* code version counters of its pages */
 	uint32_t ver[2];
 	void (*code)(void);
@@ -394,10 +400,220 @@ static void gen_dst(uint32_t numreg, int slot, int mask)
 	}
 }
 
+/*--------------------------------------------------------------------
+ * native data ALU (step 2), scaling mode 0 only (a block remembers the
+ * mode it was compiled for; nothing inside a block changes SR's S bits)
+ *
+ * An accumulator is held as its 56-bit value shifted left by 8 in a
+ * 64-bit pair: lo = A0 << 8, hi = A1 | A2 << 24.  Then ARM adds/adcs
+ * (subs/sbcs) give the 56-bit carry (borrow: inverted) and overflow
+ * directly, N is hi bit 31, and the low byte of lo is always 0.
+ *------------------------------------------------------------------*/
+
+#define F_C	0x01
+#define F_V	0x02
+#define F_Z	0x04
+#define F_N	0x08
+#define F_U	0x10
+#define F_E	0x20
+#define F_L	0x40
+
+static int jit_scal;			/* SR scaling bits of the block being compiled */
+static int jit_alu_off;			/* NEXT_DSP_JIT_ALU=0: call Hatari for every ALU op */
+
+static void smull(int lo, int hi, int rn, int rm) { emit(0xE0C00090 | hi << 16 | lo << 12 | rm << 8 | rn); }
+
+static void acc_load(int acc, int lo, int hi)
+{
+	ldr(lo, R4, OFF_REG(DSP_REG_A0 + acc));
+	dpr(AL, OP_MOV, 0, lo, 0, lo, 0, 8);
+	ldr(hi, R4, OFF_REG(DSP_REG_A1 + acc));
+	ldr(IP, R4, OFF_REG(DSP_REG_A2 + acc));
+	dpr(AL, OP_ORR, 0, hi, hi, IP, 0, 24);
+}
+
+static void acc_store(int acc, int lo, int hi)
+{
+	dpr(AL, OP_MOV, 0, IP, 0, lo, 1, 8);
+	str(IP, R4, OFF_REG(DSP_REG_A0 + acc));
+	dpi(AL, OP_BIC, 0, IP, hi, 0xff000000);
+	str(IP, R4, OFF_REG(DSP_REG_A1 + acc));
+	dpr(AL, OP_MOV, 0, IP, 0, hi, 1, 24);
+	str(IP, R4, OFF_REG(DSP_REG_A2 + acc));
+}
+
+/* hi = a 24-bit register sign extended to the accumulator's top word */
+static void reg_hi(int hi, uint32_t numreg)
+{
+	ldr(hi, R4, OFF_REG(numreg));
+	dpr(AL, OP_MOV, 0, hi, 0, hi, 0, 8);
+	dpr(AL, OP_MOV, 0, hi, 0, hi, 2, 8);
+}
+
+/* sr |= E U N Z of (hi:lo), scaling mode 0 (dsp_ccr_update_e_u_n_z) */
+static void gen_eunz(int lo, int hi, int sr)
+{
+	dpr(AL, OP_ORR, 1, R3, lo, hi, 0, 0);
+	dpi(EQ, OP_ORR, 0, sr, sr, F_Z);
+	dpi(AL, OP_TST, 1, 0, hi, 0x80000000);
+	dpi(NE, OP_ORR, 0, sr, sr, F_N);
+	/* E: bits 55..47 not all equal */
+	dpi(AL, OP_ADD, 0, R3, hi, 0x800000);
+	dpr(AL, OP_MOV, 1, R3, 0, R3, 1, 24);
+	dpi(NE, OP_ORR, 0, sr, sr, F_E);
+	/* U: bits 47 and 46 equal */
+	dpr(AL, OP_EOR, 0, R3, hi, hi, 0, 1);
+	dpi(AL, OP_TST, 1, 0, R3, 0x800000);
+	dpi(EQ, OP_ORR, 0, sr, sr, F_U);
+}
+
+/* convergent rounding, scaling mode 0 (dsp_rnd56) */
+static void gen_rnd(int lo, int hi)
+{
+	dpi(AL, OP_ADD, 1, lo, lo, 0x80000000);
+	dpi(AL, OP_ADC, 0, hi, hi, 0);
+	dpi(AL, OP_CMP, 1, 0, lo, 0);
+	dpi(EQ, OP_BIC, 0, hi, hi, 1);
+	dpi(AL, OP_MOV, 0, lo, 0, 0);
+}
+
+static void sr_load(int sr, uint32_t clear)
+{
+	ldr(sr, R4, OFF_REG(DSP_REG_SR));
+	dpi(AL, OP_BIC, 0, sr, sr, clear);
+}
+
+/* ALU byte b natively; returns 0 (nothing emitted) for the ones left to
+   Hatari: logic, shifts, ADC/SBC, ADDL/ADDR/SUBL/SUBR, CMPM, ABS/NEG/NOT */
+static int gen_alu_native(uint32_t b)
+{
+	static const uint8_t qqq[8][2] = {
+		{ DSP_REG_X0, DSP_REG_X0 }, { DSP_REG_Y0, DSP_REG_Y0 }, { DSP_REG_X1, DSP_REG_X0 }, { DSP_REG_Y1, DSP_REG_Y0 },
+		{ DSP_REG_X0, DSP_REG_Y1 }, { DSP_REG_Y0, DSP_REG_X0 }, { DSP_REG_X1, DSP_REG_Y0 }, { DSP_REG_Y1, DSP_REG_X1 } };
+	static const uint8_t jj[4] = { DSP_REG_X0, DSP_REG_Y0, DSP_REG_X1, DSP_REG_Y1 };
+	int d = (b >> 3) & 1;
+	int op;			/* 0 add, 1 sub, 2 cmp, 3 tfr */
+	int src;		/* 0..7 reg number (24-bit), 8 X, 9 Y, 10 other accumulator */
+
+	if (jit_scal != 0 || jit_alu_off) return 0;
+
+	if (b & 0x80) {		/* MPY MPYR MAC MACR */
+		int kind = b & 3, minus = b & 4, lo = R10, hi = R11;
+		ldr(R0, R4, OFF_REG(qqq[(b >> 4) & 7][0]));
+		ldr(R1, R4, OFF_REG(qqq[(b >> 4) & 7][1]));
+		dpr(AL, OP_MOV, 0, R0, 0, R0, 0, 8);
+		dpr(AL, OP_MOV, 0, R1, 0, R1, 0, 8);
+		dpr(AL, OP_MOV, 0, R1, 0, R1, 2, 7);
+		smull(R10, R11, R0, R1);	/* 2xy << 8 */
+		sr_load(R2, F_V | F_Z | F_N | F_U | F_E);
+		if (kind < 2) {
+			if (minus) {
+				dpi(AL, OP_RSB, 1, R10, R10, 0);
+				dpi(AL, OP_RSC, 0, R11, R11, 0);
+			}
+		} else {
+			acc_load(d, R0, R1);
+			dpr(AL, minus ? OP_SUB : OP_ADD, 1, R0, R0, R10, 0, 0);
+			dpr(AL, minus ? OP_SBC : OP_ADC, 1, R1, R1, R11, 0, 0);
+			dpi(VS, OP_ORR, 0, R2, R2, F_V | F_L);
+			lo = R0; hi = R1;
+		}
+		if (kind & 1) gen_rnd(lo, hi);
+		acc_store(d, lo, hi);
+		gen_eunz(lo, hi, R2);
+		str(R2, R4, OFF_REG(DSP_REG_SR));
+		return 1;
+	}
+
+	switch (b) {
+	case 0x01: case 0x09:	/* TFR B,A / A,B */
+		ldr(R0, R4, OFF_REG(DSP_REG_A0 + !d));
+		ldr(R1, R4, OFF_REG(DSP_REG_A1 + !d));
+		ldr(R2, R4, OFF_REG(DSP_REG_A2 + !d));
+		str(R0, R4, OFF_REG(DSP_REG_A0 + d));
+		str(R1, R4, OFF_REG(DSP_REG_A1 + d));
+		str(R2, R4, OFF_REG(DSP_REG_A2 + d));
+		return 1;
+	case 0x03: case 0x0b:	/* TST */
+		acc_load(d, R0, R1);
+		sr_load(R2, F_V | F_Z | F_N | F_U | F_E);
+		gen_eunz(R0, R1, R2);
+		str(R2, R4, OFF_REG(DSP_REG_SR));
+		return 1;
+	case 0x11: case 0x19:	/* RND (V and C kept) */
+		acc_load(d, R0, R1);
+		gen_rnd(R0, R1);
+		acc_store(d, R0, R1);
+		sr_load(R2, F_Z | F_N | F_U | F_E);
+		gen_eunz(R0, R1, R2);
+		str(R2, R4, OFF_REG(DSP_REG_SR));
+		return 1;
+	case 0x13: case 0x1b:	/* CLR */
+		dpi(AL, OP_MOV, 0, R0, 0, 0);
+		str(R0, R4, OFF_REG(DSP_REG_A0 + d));
+		str(R0, R4, OFF_REG(DSP_REG_A1 + d));
+		str(R0, R4, OFF_REG(DSP_REG_A2 + d));
+		sr_load(R2, F_V | F_Z | F_N | F_U | F_E);
+		dpi(AL, OP_ORR, 0, R2, R2, F_U | F_Z);
+		str(R2, R4, OFF_REG(DSP_REG_SR));
+		return 1;
+	case 0x05: case 0x0d: op = 2; src = 10; break;	/* CMP B,A / A,B */
+	case 0x10: case 0x18: op = 0; src = 10; break;	/* ADD B,A / A,B */
+	case 0x14: case 0x1c: op = 1; src = 10; break;	/* SUB */
+	case 0x20: case 0x28: op = 0; src = 8; break;	/* ADD X */
+	case 0x30: case 0x38: op = 0; src = 9; break;	/* ADD Y */
+	case 0x24: case 0x2c: op = 1; src = 8; break;	/* SUB X */
+	case 0x34: case 0x3c: op = 1; src = 9; break;	/* SUB Y */
+	default:
+		if (b < 0x40) return 0;
+		src = jj[(b >> 4) & 3];
+		switch (b & 7) {
+		case 0: op = 0; break;
+		case 4: op = 1; break;
+		case 5: op = 2; break;
+		case 1:		/* TFR reg,D: A0 = 0, A1 = reg, A2 = sign */
+			reg_hi(R1, src);
+			dpi(AL, OP_MOV, 0, R0, 0, 0);
+			acc_store(d, R0, R1);
+			return 1;
+		default: return 0;
+		}
+	}
+
+	/* ADD / SUB / CMP: source in R10 (lo) R11 (hi), or R11 alone (lo 0) */
+	if (src == 10) acc_load(!d, R10, R11);
+	else if (src >= 8) {
+		uint32_t r1 = src == 8 ? DSP_REG_X1 : DSP_REG_Y1, r0 = src == 8 ? DSP_REG_X0 : DSP_REG_Y0;
+		ldr(R10, R4, OFF_REG(r0));
+		dpr(AL, OP_MOV, 0, R10, 0, R10, 0, 8);
+		reg_hi(R11, r1);
+	} else reg_hi(R11, src);
+	acc_load(d, R0, R1);
+	sr_load(R2, F_C | F_V | F_Z | F_N | F_U | F_E);
+	if (op == 0) {
+		if (src < 8) dpi(AL, OP_ADD, 1, R0, R0, 0);
+		else dpr(AL, OP_ADD, 1, R0, R0, R10, 0, 0);
+		dpr(AL, OP_ADC, 1, R1, R1, R11, 0, 0);
+		dpi(HS, OP_ORR, 0, R2, R2, F_C);
+	} else {
+		if (src < 8) dpi(AL, OP_SUB, 1, R0, R0, 0);
+		else dpr(AL, OP_SUB, 1, R0, R0, R10, 0, 0);
+		dpr(AL, OP_SBC, 1, R1, R1, R11, 0, 0);
+		dpi(LO, OP_ORR, 0, R2, R2, F_C);
+	}
+	dpi(VS, OP_ORR, 0, R2, R2, F_V | F_L);
+	if (op != 2) acc_store(d, R0, R1);
+	gen_eunz(R0, R1, R2);
+	str(R2, R4, OFF_REG(DSP_REG_SR));
+	return 1;
+}
+
 static void gen_alu(uint32_t inst)
 {
 	dsp_emul_t f = opcodes_alu[inst & 0xff];
-	if (f != dsp_move) call((const void *)f);
+	if (f == dsp_move) return;
+	if (gen_alu_native(inst & 0xff)) return;
+	call((const void *)f);
 }
 
 static int jit_dst_ok(uint32_t r)  { return (r >= DSP_REG_X0 && r <= DSP_REG_Y1) || r == DSP_REG_A || r == DSP_REG_B; }
@@ -588,6 +804,8 @@ static int jit_init(void)
 	if (e && *e == '0') { jit_off = 1; return -1; }
 	e = getenv("NEXT_DSP_JIT_MAX");
 	if (e && atoi(e) > 0 && atoi(e) < JIT_MAX) jit_max = atoi(e);
+	e = getenv("NEXT_DSP_JIT_ALU");
+	if (e && *e == '0') jit_alu_off = 1;
 	jit_mem = mmap(NULL, JIT_CODE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (jit_mem == MAP_FAILED) { jit_mem = NULL; jit_off = 1; return -1; }
 	jit_pool = calloc(JIT_POOL, sizeof(jit_block_t));
@@ -614,6 +832,7 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip)
 	b->clip = clip;
 	b->code = NULL;
 	b->nw = 0;
+	b->scal = jit_scal = (dsp_core.registers[DSP_REG_SR] >> DSP_SR_S0) & 3;
 	dsp_jit_stats[3]++;
 
 	/* the run of instructions that stay in a block */
@@ -826,7 +1045,8 @@ int dsp56k_jit_step(uint32_t *cycles)
 	b = *slot;
 	if (!b || (b->start != pc && ++dsp_jit_stats[4]) || (!jit_valid(b) && ++dsp_jit_stats[5]) ||
 	    (b->n && lf && la >= b->start && la < b->last && ++dsp_jit_stats[6]) ||
-	    (b->clip != 0xffff && !(lf && la == b->clip) && ++dsp_jit_stats[7])) {
+	    (b->clip != 0xffff && !(lf && la == b->clip) && ++dsp_jit_stats[7]) ||
+	    (b->scal != ((dsp_core.registers[DSP_REG_SR] >> DSP_SR_S0) & 3) && ++dsp_jit_stats[5])) {
 		/* (a block clipped at an LA is kept only while that loop runs) */
 		b = jit_compile(pc, lf && la >= pc ? la : 0xffff);
 		*slot = b;
