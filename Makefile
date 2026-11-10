@@ -93,15 +93,15 @@ $(BUILDDIR)/%.png.o: %.png
 ifneq ($(MAKECMDGOALS), clean)
 -include $(DEP)
 endif
-$(BUILDDIR)/%.c.d: %.c
+$(BUILDDIR)/%.c.d: %.c Makefile
 	@mkdir -p $(dir $(BUILDDIR)/$*)
 	$(Q)$(info $< >> $@)
-	$(Q)$(CC) $(DFLAGS) -MM $< -MT $@ -MT $*.c.o -MF $@ 2>&1 | $(OUTPUT_FILTER)
+	$(Q)$(CC) $(DFLAGS) -MM -MP $< -MT $@ -MT $(BUILDDIR)/$*.c.o -MF $@ 2>&1 | $(OUTPUT_FILTER)
 
-$(BUILDDIR)/%.cpp.d: %.cpp
+$(BUILDDIR)/%.cpp.d: %.cpp Makefile
 	@mkdir -p $(dir $(BUILDDIR)/$*)
 	$(Q)$(info $< >> $@)
-	$(Q)$(CC) $(DFLAGS) -MM $< -MT $@ -MT $*.cpp.o -MF $@ 2>&1 | $(OUTPUT_FILTER)
+	$(Q)$(CC) $(DFLAGS) -MM -MP $< -MT $@ -MT $(BUILDDIR)/$*.cpp.o -MF $@ 2>&1 | $(OUTPUT_FILTER)
 
 # Ensure correct time stamp
 $(BUILDDIR)/main.cpp.o: $(filter-out $(BUILDDIR)/main.cpp.o, $(OBJ))
