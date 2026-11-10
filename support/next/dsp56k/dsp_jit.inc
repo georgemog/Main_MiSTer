@@ -46,6 +46,14 @@
  * Jcc exits.  Such blocks keep up to JIT_PV code pages and JIT_NR
  * external code ranges, and are only entered with LF clear.
  *
+ * Step 5: a block is compiled for the M registers in force at entry
+ * (recorded, checked at entry): linear updates lose their runtime check,
+ * and modulo +-1 is inline with its bounds folded.  A or B as a move
+ * source is read inline (limiting on the slow path).  Instructions
+ * without memory accesses skip the access bits, wait states and exit
+ * test.  An ALU op whose flags the next ALU op overwrites defers them
+ * (S_FLO/S_FHI/S_FPSR), rebuilt only if the block exits right after it.
+ *
  * Code changes: a block keeps the P words it was compiled from and checks
  * them on entry.  Changing the external RAM (pointer or size) drops all.
  */
@@ -80,6 +88,8 @@ typedef struct jit_block_s {
 	uint16_t scal;			/* SR scaling bits it was compiled for */
 	uint8_t npv;			/* code pages */
 	uint8_t jumps;			/* follows jumps: only entered with no loop active */
+	uint8_t mmask;			/* M registers its address updates were compiled for */
+	uint16_t m[8];
 	const uint32_t *pv[JIT_PV];	/* code version counters of its pages */
 	uint32_t ver[JIT_PV];
 	void (*code)(void);
@@ -277,6 +287,10 @@ static void bto(int cond, uint32_t *target)
 #define S_VAL2	12
 #define S_CNT	16	/* instructions of earlier DO-loop passes */
 #define S_AGUV	20	/* old value of the R/N register the previous instruction moved to */
+#define S_FLO	24	/* deferred flags: the ALU result (lo, hi) and the ARM flags */
+#define S_FHI	28
+#define S_FPSR	32
+#define S_FRAME	40
 
 /* AGU pipeline at compile time: a parallel move to R/N takes effect for
    addressing one instruction later (Hatari's agu_pipeline).  jit_prev_agu
@@ -302,27 +316,58 @@ static void ldr_rn(int rd, uint32_t numreg)
 #define JIT_LOOP_BUDGET	256	/* instructions before a looping block returns */
 
 /* address of R[n] per ea mode (1 (Rn)+Nn, 0 (Rn)-Nn, 2 (Rn)-, 3 (Rn)+, 4 (Rn)) to slot */
+/* M registers a block was compiled for (step 5): a block records the ones
+   its address updates use, and is recompiled when one differs at entry
+   (only movec and the like change M, and they end blocks) */
+static uint32_t jit_m[8];
+static uint8_t jit_mmask;
+static int jit_scal;			/* (defined with the native ALU below) */
+
+static void bfc(int rd, int width) { emit(0xE7C0001F | (width - 1) << 16 | rd << 12); }
+
 static void gen_ea(uint32_t ea_mode, int slot)
 {
-	uint32_t mode = (ea_mode >> 3) & 7, n = ea_mode & 7;
-	uint32_t *slow, *done;
+	uint32_t mode = (ea_mode >> 3) & 7, n = ea_mode & 7, m;
 
 	ldr_rn(R10, DSP_REG_R0 + n);
 	str(R10, SP, slot);
 	if (mode == 4) return;
-	ldr(R11, R4, OFF_REG(DSP_REG_M0 + n));
-	cmpi(R11, 0xffff);
-	slow = bcc(NE);
-	switch (mode) {
-	case 0: ldr_rn(R1, DSP_REG_N0 + n); dpr(AL, OP_SUB, 0, R0, R10, R1, 0, 0); break;
-	case 1: ldr_rn(R1, DSP_REG_N0 + n); dpr(AL, OP_ADD, 0, R0, R10, R1, 0, 0); break;
-	case 2: dpi(AL, OP_SUB, 0, R0, R10, 1); break;
-	case 3: dpi(AL, OP_ADD, 0, R0, R10, 1); break;
+	jit_mmask |= 1 << n;
+	m = jit_m[n];
+	if (m == 0xffff) {
+		switch (mode) {
+		case 0: ldr_rn(R1, DSP_REG_N0 + n); dpr(AL, OP_SUB, 0, R0, R10, R1, 0, 0); break;
+		case 1: ldr_rn(R1, DSP_REG_N0 + n); dpr(AL, OP_ADD, 0, R0, R10, R1, 0, 0); break;
+		case 2: dpi(AL, OP_SUB, 0, R0, R10, 1); break;
+		case 3: dpi(AL, OP_ADD, 0, R0, R10, 1); break;
+		}
+		ubfx(R0, R0, 0, 16);
+		str(R0, R4, OFF_REG(DSP_REG_R0 + n));
+		return;
 	}
-	ubfx(R0, R0, 0, 16);
-	str(R0, R4, OFF_REG(DSP_REG_R0 + n));
-	done = bcc(AL);
-	patch(slow, ep);
+	if (m >= 1 && m <= 32767 && (mode == 2 || mode == 3)) {
+		/* modulo, +-1 (dsp_update_rn_modulo with the bounds folded) */
+		uint32_t k = 32 - __builtin_clz(m), modulo = m + 1;
+		uint32_t *notabove, *done;
+		dpi(AL, OP_ORR, 0, R0, R10, 0x10000);		/* r_reg */
+		dpr(AL, OP_MOV, 0, R1, 0, R0, 0, 0);
+		bfc(R1, k);					/* lobound */
+		opi(OP_ADD, R2, R1, m);				/* hibound */
+		dpi(AL, mode == 3 ? OP_ADD : OP_SUB, 0, R0, R0, 1);
+		mov32(R3, modulo);
+		dpr(AL, OP_CMP, 1, 0, R0, R2, 0, 0);
+		notabove = bcc(LS);
+		dpr(AL, OP_SUB, 0, R0, R0, R3, 0, 0);
+		done = bcc(AL);
+		patch(notabove, ep);
+		dpr(AL, OP_CMP, 1, 0, R0, R1, 0, 0);
+		dpr(LO, OP_ADD, 0, R0, R0, R3, 0, 0);
+		patch(done, ep);
+		ubfx(R0, R0, 0, 16);
+		str(R0, R4, OFF_REG(DSP_REG_R0 + n));
+		return;
+	}
+	/* other modes (modulo +-N, bit reverse): Hatari's update */
 	dpi(AL, OP_MOV, 0, R0, 0, n);
 	dpr(AL, OP_MOV, 0, R1, 0, R10, 0, 0);
 	switch (mode) {
@@ -331,9 +376,8 @@ static void gen_ea(uint32_t ea_mode, int slot)
 	case 2: dpi(AL, OP_MVN, 0, R2, 0, 0); break;
 	case 3: dpi(AL, OP_MOV, 0, R2, 0, 1); break;
 	}
-	dpr(AL, OP_MOV, 0, R3, 0, R11, 0, 0);
+	mov32(R3, m);
 	call((const void *)jit_urn);
-	patch(done, ep);
 }
 
 /* inline external-RAM index of the address in ra, for space, into IP;
@@ -432,7 +476,25 @@ static void gen_write(int space)
 /* register source (24 bits, A/B limited) to slot */
 static void gen_src(uint32_t numreg, int slot)
 {
-	if (numreg == DSP_REG_A || numreg == DSP_REG_B) {
+	if ((numreg == DSP_REG_A || numreg == DSP_REG_B) && jit_scal == 0) {
+		/* A1/B1, limited when A2 is not A1's sign extension
+		   (dsp_pm_read_accu24, scaling mode 0) */
+		int r = numreg & 1;
+		uint32_t *ok;
+		ldr(R0, R4, OFF_REG(DSP_REG_A1 + r));
+		ldr(R1, R4, OFF_REG(DSP_REG_A2 + r));
+		dpr(AL, OP_ORR, 0, R2, R0, R1, 0, 24);
+		dpr(AL, OP_MOV, 0, R3, 0, R2, 0, 8);
+		dpr(AL, OP_CMP, 1, 0, R2, R3, 2, 8);	/* cmp r2, r3, asr #8 */
+		ok = bcc(EQ);
+		dpi(AL, OP_MOV, 0, R0, 0, 0x800000);
+		dpi(AL, OP_TST, 1, 0, R1, 0x80);
+		dpi(EQ, OP_SUB, 0, R0, R0, 1);
+		ldr(R2, R4, OFF_REG(DSP_REG_SR));
+		dpi(AL, OP_ORR, 0, R2, R2, 1 << DSP_SR_L);
+		str(R2, R4, OFF_REG(DSP_REG_SR));
+		patch(ok, ep);
+	} else if (numreg == DSP_REG_A || numreg == DSP_REG_B) {
 		dpi(AL, OP_MOV, 0, R0, 0, numreg);
 		call((const void *)jit_accu);
 	} else {
@@ -563,6 +625,74 @@ static void sr_load(int sr, uint32_t clear)
 	dpi(AL, OP_BIC, 0, sr, sr, clear);
 }
 
+/* deferred flags (step 5): an ALU op whose flags the next instruction's
+   ALU op overwrites skips computing them.  It still sets L (sticky), and
+   keeps its result and the ARM flags in S_FLO/S_FHI/S_FPSR, so that an
+   exit right after it can build SR (gen_lazy_sr).  Classes: 1 MAC/MACR,
+   2 MPY/MPYR, 3 ADD, 4 SUB/CMP, 5 TST, 6 RND. */
+static int jit_lazy;
+
+static int alu_cls(uint32_t b)
+{
+	if (jit_scal != 0 || jit_alu_off) return 0;
+	if (b & 0x80) return (b & 2) ? 1 : 2;
+	switch (b) {
+	case 0x03: case 0x0b: return 5;
+	case 0x11: case 0x19: return 6;
+	case 0x10: case 0x18: case 0x20: case 0x28: case 0x30: case 0x38: return 3;
+	case 0x05: case 0x0d: case 0x14: case 0x1c: case 0x24: case 0x2c: case 0x34: case 0x3c: return 4;
+	}
+	if (b >= 0x40) switch (b & 7) { case 0: return 3; case 4: case 5: return 4; }
+	return 0;
+}
+
+/* CCR bits an ALU op always writes (natively) */
+static uint32_t alu_wmask(uint32_t b)
+{
+	static const uint8_t w[7] = { 0, 0x3e, 0x3e, 0x3f, 0x3f, 0x3e, 0x3c };
+	if (jit_scal == 0 && !jit_alu_off && (b == 0x13 || b == 0x1b)) return 0x3e;	/* CLR */
+	return w[alu_cls(b)];
+}
+
+static void condw(int cond) { ep[-1] = (ep[-1] & 0x0fffffff) | (uint32_t)cond << 28; }
+
+/* after the op's adds/adcs: keep the ARM flags, and set L if V */
+static void lazy_vl(void)
+{
+	emit(0xE10F0000 | R3 << 12);			/* mrs r3, apsr */
+	str(R3, SP, S_FPSR);
+	ldr(R2, R4, OFF_REG(DSP_REG_SR)); condw(VS);
+	dpi(VS, OP_ORR, 0, R2, R2, F_L);
+	str(R2, R4, OFF_REG(DSP_REG_SR)); condw(VS);
+}
+
+static void lazy_keep(int lo, int hi)
+{
+	str(lo, SP, S_FLO);
+	str(hi, SP, S_FHI);
+}
+
+/* SR from deferred flags of class cls */
+static void gen_lazy_sr(int cls)
+{
+	static const uint8_t clr[7] = { 0, 0x3e, 0x3e, 0x3f, 0x3f, 0x3e, 0x3c };
+	ldr(R0, SP, S_FLO);
+	ldr(R1, SP, S_FHI);
+	ldr(R2, R4, OFF_REG(DSP_REG_SR));
+	dpi(AL, OP_BIC, 0, R2, R2, clr[cls]);
+	if (cls == 1 || cls == 3 || cls == 4) {
+		ldr(R3, SP, S_FPSR);
+		dpi(AL, OP_TST, 1, 0, R3, 1u << 28);
+		dpi(NE, OP_ORR, 0, R2, R2, F_V);
+		if (cls != 1) {
+			dpi(AL, OP_TST, 1, 0, R3, 1u << 29);
+			dpi(cls == 3 ? NE : EQ, OP_ORR, 0, R2, R2, F_C);
+		}
+	}
+	gen_eunz(R0, R1, R2);
+	str(R2, R4, OFF_REG(DSP_REG_SR));
+}
+
 /* ALU byte b natively; returns 0 (nothing emitted) for the ones left to
    Hatari: logic, shifts, ADC/SBC, ADDL/ADDR/SUBL/SUBR, CMPM, ABS/NEG/NOT */
 static int gen_alu_native(uint32_t b)
@@ -585,7 +715,7 @@ static int gen_alu_native(uint32_t b)
 		dpr(AL, OP_MOV, 0, R1, 0, R1, 0, 8);
 		dpr(AL, OP_MOV, 0, R1, 0, R1, 2, 7);
 		smull(R10, R11, R0, R1);	/* 2xy << 8 */
-		sr_load(R2, F_V | F_Z | F_N | F_U | F_E);
+		if (!jit_lazy) sr_load(R2, F_V | F_Z | F_N | F_U | F_E);
 		if (kind < 2) {
 			if (minus) {
 				dpi(AL, OP_RSB, 1, R10, R10, 0);
@@ -595,11 +725,13 @@ static int gen_alu_native(uint32_t b)
 			acc_load(d, R0, R1);
 			dpr(AL, minus ? OP_SUB : OP_ADD, 1, R0, R0, R10, 0, 0);
 			dpr(AL, minus ? OP_SBC : OP_ADC, 1, R1, R1, R11, 0, 0);
-			dpi(VS, OP_ORR, 0, R2, R2, F_V | F_L);
+			if (jit_lazy) lazy_vl();
+			else dpi(VS, OP_ORR, 0, R2, R2, F_V | F_L);
 			lo = R0; hi = R1;
 		}
 		if (kind & 1) gen_rnd(lo, hi);
 		acc_store(d, lo, hi);
+		if (jit_lazy) { lazy_keep(lo, hi); return 1; }
 		gen_eunz(lo, hi, R2);
 		str(R2, R4, OFF_REG(DSP_REG_SR));
 		return 1;
@@ -616,6 +748,7 @@ static int gen_alu_native(uint32_t b)
 		return 1;
 	case 0x03: case 0x0b:	/* TST */
 		acc_load(d, R0, R1);
+		if (jit_lazy) { lazy_keep(R0, R1); return 1; }
 		sr_load(R2, F_V | F_Z | F_N | F_U | F_E);
 		gen_eunz(R0, R1, R2);
 		str(R2, R4, OFF_REG(DSP_REG_SR));
@@ -624,6 +757,7 @@ static int gen_alu_native(uint32_t b)
 		acc_load(d, R0, R1);
 		gen_rnd(R0, R1);
 		acc_store(d, R0, R1);
+		if (jit_lazy) { lazy_keep(R0, R1); return 1; }
 		sr_load(R2, F_Z | F_N | F_U | F_E);
 		gen_eunz(R0, R1, R2);
 		str(R2, R4, OFF_REG(DSP_REG_SR));
@@ -669,6 +803,21 @@ static int gen_alu_native(uint32_t b)
 		reg_hi(R11, r1);
 	} else reg_hi(R11, src);
 	acc_load(d, R0, R1);
+	if (jit_lazy) {
+		if (op == 0) {
+			if (src < 8) dpi(AL, OP_ADD, 1, R0, R0, 0);
+			else dpr(AL, OP_ADD, 1, R0, R0, R10, 0, 0);
+			dpr(AL, OP_ADC, 1, R1, R1, R11, 0, 0);
+		} else {
+			if (src < 8) dpi(AL, OP_SUB, 1, R0, R0, 0);
+			else dpr(AL, OP_SUB, 1, R0, R0, R10, 0, 0);
+			dpr(AL, OP_SBC, 1, R1, R1, R11, 0, 0);
+		}
+		lazy_vl();
+		if (op != 2) acc_store(d, R0, R1);
+		lazy_keep(R0, R1);
+		return 1;
+	}
 	sr_load(R2, F_C | F_V | F_Z | F_N | F_U | F_E);
 	if (op == 0) {
 		if (src < 8) dpi(AL, OP_ADD, 1, R0, R0, 0);
@@ -725,6 +874,12 @@ static int jit_native(uint32_t inst)
 		return 1;
 	}
 	return 0;
+}
+
+/* does a native instruction access X/Y memory (and so set r9)? */
+static int jit_mem_inst(uint32_t inst)
+{
+	return inst >= 0x100000 && ((inst >> 20) & 0xf) >= 4;
 }
 
 /* one instruction (after jit_native said yes) */
@@ -968,7 +1123,7 @@ static int jit_init(void)
 	e = getenv("NEXT_DSP_JIT_MAX");
 	if (e && atoi(e) > 0 && atoi(e) < JIT_MAX) jit_max = atoi(e);
 	e = getenv("NEXT_DSP_JIT_DBG");
-	if (e && *e == '1') jit_dbg = 1;
+	if (e && *e >= '1' && *e <= '2') jit_dbg = *e - '0';	/* 2: also exit after every deferred-flags op */
 	e = getenv("NEXT_DSP_JIT_ALU");
 	if (e && *e == '0') jit_alu_off = 1;
 	jit_mem = mmap(NULL, JIT_CODE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1047,16 +1202,19 @@ static int jit_add_range(uint32_t f, uint32_t l)
 }
 
 /* exit requests: a branch to a stub that returns count, pc, len */
-static struct { uint32_t *br; uint16_t cnt, pc, len; } jit_xr[4 * JIT_MAX];
+static struct { uint32_t *br; uint16_t cnt, pc, len; uint8_t lz; } jit_xr[4 * JIT_MAX];
 static int jit_nxr;
 
-static void exit_if(int cond, int cnt, uint32_t xpc, uint32_t xlen)
+static void exit_if_lz(int cond, int cnt, uint32_t xpc, uint32_t xlen, int lz)
 {
 	if (jit_nxr >= 4 * JIT_MAX) { ep_overflow = 1; return; }
 	jit_xr[jit_nxr].br = bcc(cond);
 	jit_xr[jit_nxr].cnt = cnt; jit_xr[jit_nxr].pc = xpc; jit_xr[jit_nxr].len = xlen;
+	jit_xr[jit_nxr].lz = lz;
 	jit_nxr++;
 }
+
+static void exit_if(int cond, int cnt, uint32_t xpc, uint32_t xlen) { exit_if_lz(cond, cnt, xpc, xlen, 0); }
 
 /* S_CNT += cnt; on to target unless the budget is spent (then exit as given) */
 static void gen_back(uint32_t *target, int cnt, int xcnt, uint32_t xpc, uint32_t xlen)
@@ -1112,6 +1270,8 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf)
 	jit_npv = 0;
 	jit_nr = 0;
 	jit_nxr = 0;
+	jit_mmask = 0;
+	for (i = 0; i < 8; i++) jit_m[i] = dsp_core.registers[DSP_REG_M0 + i];
 
 	/* the instructions that stay in a block: straight runs, an inline DO
 	   loop (body to LA, then on), and (no loop active) jumps followed to
@@ -1181,6 +1341,7 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf)
 	b->n = n;
 	b->last = n ? ia[n - 1] : pc;
 	b->jumps = has_jump;
+	b->mmask = 0;
 	if (!n) { jit_npv = 0; jit_add_pages(pc, pc); }
 	b->npv = jit_npv;
 	for (i = 0; i < jit_npv; i++) { b->pv[i] = jit_npv_p[i]; b->ver[i] = *b->pv[i]; }
@@ -1205,7 +1366,7 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf)
 	ep_end = (uint32_t *)(jit_mem + JIT_CODE_SIZE);
 	ep_overflow = 0;
 	emit(0xE92D4FF8);				/* push {r3-r11, lr} */
-	dpi(AL, OP_SUB, 0, SP, SP, 32);
+	dpi(AL, OP_SUB, 0, SP, SP, S_FRAME);
 	mov32(R4, (uint32_t)(uintptr_t)&dsp_core);
 	mov32(R6, (uint32_t)(uintptr_t)&dsp_core.ramint[DSP_SPACE_X][0]);
 	mov32(R7, (uint32_t)(uintptr_t)&dsp_core.ramint[DSP_SPACE_Y][0]);
@@ -1216,8 +1377,16 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf)
 
 	jit_prev_agu = 0;
 	for (i = 0; i < n; i++) {
+		int lz = 0;
 		lbl[i] = ep;
 		jit_cur_agu = 0;
+		/* this ALU op's flags are dead if the next instruction's ALU op
+		   writes all of them (control always goes on to it, or exits) */
+		if (ik[i] == K_NAT && iw[i] >= 0x100000 && i + 1 < n && ik[i + 1] == K_NAT && iw[i + 1] >= 0x100000 &&
+		    lend[i] < 0 && !iback[i]) {
+			uint32_t wi = alu_wmask(iw[i] & 0xff), wn = alu_wmask(iw[i + 1] & 0xff);
+			if (alu_cls(iw[i] & 0xff) && wn && !(wi & ~wn)) lz = alu_cls(iw[i] & 0xff);
+		}
 		if (ik[i] == K_TAIL) {
 			/* the tail: Hatari's handler; falls through to the end with
 			   the PC and length it left in jit_out */
@@ -1248,14 +1417,26 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf)
 			}
 			if (ik[i] == K_JMP || ik[i] == K_JCC) {
 				dpi(AL, OP_MOV, 0, R10, 0, icy[i]);
-			} else {
-				dpi(AL, OP_MOV, 0, R9, 0, ia[i] >= 0x200 ? 4 : 0);	/* P fetch external */
+			} else if (!jit_mem_inst(iw[i])) {
+				jit_lazy = lz;
 				gen_inst(iw[i]);
-				/* cycles: 2 + wait states */
+				jit_lazy = 0;
+				dpi(AL, OP_MOV, 0, R10, 0, 2);
+			} else {
+				uint32_t *noext;
+				dpi(AL, OP_MOV, 0, R9, 0, ia[i] >= 0x200 ? 4 : 0);	/* P fetch external */
+				jit_lazy = lz;
+				gen_inst(iw[i]);
+				jit_lazy = 0;
+				/* cycles: 2 + wait states (none without an external X/Y access) */
+				dpi(AL, OP_MOV, 0, R10, 0, 2);
+				dpi(AL, OP_TST, 1, 0, R9, 3);
+				noext = bcc(EQ);
 				dpi(AL, OP_AND, 0, R0, R9, 7);
 				mov32(IP, (uint32_t)(uintptr_t)jit_wait);
 				ldrb_x(R0, IP, R0);
 				dpi(AL, OP_ADD, 0, R10, R0, 2);
+				patch(noext, ep);
 			}
 		}
 		dpr(AL, OP_ADD, 0, R5, R5, R10, 0, 0);
@@ -1284,9 +1465,14 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf)
 			continue;
 		}
 		/* a peripheral or this block's code was touched, an AGU delay is
-		   pending, or an interrupt was raised: end after this instruction */
-		dpi(AL, OP_TST, 1, 0, R9, JF_EXIT);
-		exit_if(NE, i + 1, epc[i], elen[i]);
+		   pending, or an interrupt was raised: end after this instruction
+		   (only memory accesses and Hatari's handlers can) */
+		if (lz && jit_dbg == 2) {
+			exit_if_lz(AL, i + 1, epc[i], elen[i], lz);
+		} else if (ik[i] != K_NAT || jit_mem_inst(iw[i])) {
+			dpi(AL, OP_TST, 1, 0, R9, JF_EXIT);
+			exit_if_lz(NE, i + 1, epc[i], elen[i], lz);
+		}
 		jit_prev_agu = ik[i] == K_NAT ? jit_cur_agu : 0;
 		if (lend[i] >= 0) {
 			/* inline DO loop end at LA: again while LC > 1, else pop */
@@ -1354,6 +1540,7 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf)
 		to_epi[jit_nxr] = bcc(AL);
 		for (i = 0; i < jit_nxr; i++) {
 			patch(jit_xr[i].br, ep);
+			if (jit_xr[i].lz) gen_lazy_sr(jit_xr[i].lz);
 			ldr(R0, SP, S_CNT);
 			opi(OP_ADD, R0, R0, jit_xr[i].cnt);
 			mov32(R1, jit_xr[i].pc);
@@ -1370,7 +1557,7 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf)
 		str(R5, IP, 12);
 		emit(0xE1C000B0 | R4 << 16 | R10 << 12 |
 		     ((offsetof(dsp_core_t, instr_cycle) >> 4) & 0xf) << 8 | (offsetof(dsp_core_t, instr_cycle) & 0xf));	/* strh r10, [r4, #instr_cycle] */
-		dpi(AL, OP_ADD, 0, SP, SP, 32);
+		dpi(AL, OP_ADD, 0, SP, SP, S_FRAME);
 		emit(0xE8BD8FF8);			/* pop {r3-r11, pc} */
 	}
 	if (ep_overflow) {
@@ -1378,9 +1565,18 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf)
 		return NULL;
 	}
 	__builtin___clear_cache((char *)start, (char *)ep);
+	b->mmask = jit_mmask;
+	for (i = 0; i < 8; i++) b->m[i] = jit_m[i];
 	b->code = (void (*)(void))start;
 	jit_ptr = (uint8_t *)ep;
 	return b;
+}
+
+static int jit_m_ok(const jit_block_t *b)
+{
+	for (int i = 0; i < 8; i++)
+		if ((b->mmask >> i & 1) && dsp_core.registers[DSP_REG_M0 + i] != b->m[i]) return 0;
+	return 1;
 }
 
 static int jit_valid(const jit_block_t *b)
@@ -1454,7 +1650,8 @@ int dsp56k_jit_step(uint32_t *cycles)
 	    (b->n && lf && la >= b->start && la < b->last && ++dsp_jit_stats[6]) ||
 	    (b->clip != 0xffff && !(lf && la == b->clip) && ++dsp_jit_stats[7]) ||
 	    (b->scal != ((dsp_core.registers[DSP_REG_SR] >> DSP_SR_S0) & 3) && ++dsp_jit_stats[5]) ||
-	    (b->jumps && lf && ++dsp_jit_stats[7])) {
+	    (b->jumps && lf && ++dsp_jit_stats[7]) ||
+	    (b->mmask && !jit_m_ok(b) && ++dsp_jit_stats[5])) {
 		/* (a block clipped at an LA is kept only while that loop runs) */
 		b = jit_compile(pc, lf && la >= pc ? la : 0xffff, lf);
 		*slot = b;

@@ -36,7 +36,9 @@
   blocks (to find which instruction differs); `NEXT_DSP_JIT_ALU=0` calls Hatari for
   every ALU op (to tell native ALU bugs from the rest); `NEXT_DSP_JIT=0` turns the JIT off.
   `NEXT_DSP_JIT_DBG=1` records each block instruction's cycles and the running
-  total, which lockstep prints beside the reference's on a cycle mismatch.
+  total, which lockstep prints beside the reference's on a cycle mismatch;
+  `NEXT_DSP_JIT_DBG=2` also ends the block after every ALU op whose flags
+  were deferred, so lockstep checks the rebuilt SR each time.
   The fuzz seed is ORed with 1, so use odd seeds (2 and 3 are the same run);
   ROUNDS counts programs of about 420 instructions each.
   `dspbench`: `JIT=1` runs the kernels through the JIT.
