@@ -59,6 +59,9 @@
  * pending (b->eagu); (Rn+Nn), -(Rn), absolute and immediate operands and
  * the R: class (pm1) are native.
  *
+ * Step 7: A and B stay in ARM registers across a block (see jit_rc);
+ * NEXT_DSP_JIT_RC=0 keeps them in dsp_core instead.
+ *
  * Code changes: a block keeps the P words it was compiled from and checks
  * them on entry.  Changing the external RAM (pointer or size) drops all.
  */
@@ -142,9 +145,14 @@ uint32_t dsp_jit_stats[8];		/* blocks run, instructions in blocks, interpreted, 
  * helpers called from generated code
  *------------------------------------------------------------------*/
 
-#define JF_PERIPH	0x100
-#define JF_SMC		0x200	/* wrote this block's own code: end after this instruction */
+#define JF_PERIPH	0x10
+#define JF_SMC		0x20	/* wrote this block's own code: end after this instruction */
 #define JF_EXIT		(JF_PERIPH | JF_SMC)
+/* in generated code the access bits (X=1 Y=2 P=4) and these flags of the
+   current instruction live in r5 bits 24-29 (FB), above the cycles */
+#define FS		24
+#define FB(x)		((uint32_t)(x) << FS)
+#define FB_MASK		FB(0x3f)
 
 /* returns value | flags << 32 (access bits X=1 Y=2 P=4, JF_PERIPH) */
 static uint64_t jit_rd(uint32_t space, uint32_t address)
@@ -250,10 +258,39 @@ static void ldrb_x(int rd, int rn, int rm) { emit(0xE7D00000 | rn << 16 | rd << 
 static void ubfx(int rd, int rn, int lsb, int width) { emit(0xE7E00050 | (width - 1) << 16 | rd << 12 | lsb << 7 | rn); }
 static void blx(int rm) { emit(0xE12FFF30 | rm); }
 
+/* register cache (step 7): in blocks with the native ALU, A lives in
+   r6:r7 and B in r8:lr, as the ALU holds them (lo = A0 << 8, hi = A1 |
+   A2 << 24).  Loaded in the prologue, written back in the epilogue and
+   around Hatari handlers (call_sync); every call saves lr (call). */
+static int jit_rc;			/* this block caches A/B */
+static int jit_rc_off;			/* NEXT_DSP_JIT_RC=0 */
+#define CLO(a)	((a) ? R8 : R6)
+#define CHI(a)	((a) ? LR : R7)
+#define S_LR	36
+
+static void ldr(int rd, int rn, int off);
+static void str(int rd, int rn, int off);
+
 static void call(const void *fn)
 {
+	if (jit_rc) str(LR, SP, S_LR);
 	mov32(IP, (uint32_t)(uintptr_t)fn);
 	blx(IP);
+	if (jit_rc) ldr(LR, SP, S_LR);
+}
+
+static void rc_writeback(void);
+static void rc_reload(void);
+
+/* a Hatari handler, which may read or write A/B: the core holds them
+   across it (arguments in r0-r3 and the result in r0 are kept) */
+static void call_sync(const void *fn)
+{
+	if (!jit_rc) { call(fn); return; }
+	rc_writeback();
+	mov32(IP, (uint32_t)(uintptr_t)fn);
+	blx(IP);
+	rc_reload();
 }
 
 /* branches: emit with a placeholder, patch later */
@@ -279,11 +316,13 @@ static void bto(int cond, uint32_t *target)
 /*--------------------------------------------------------------------
  * code generation
  *
- * r4 &dsp_core, r5 cycles of the block, r6 X internal RAM, r7 Y internal
- * RAM, r8 external RAM, r9 this instruction's access bits, r10 this
- * instruction's cycles (and a scratch before that), r11 scratch.
- * Stack: [sp] x/single address, [sp+4] y address, [sp+8] value 1,
- * [sp+12] value 2.
+ * r4 &dsp_core; r5 cycles of the block, with this instruction's access
+ * bits and exit flags in bits 24-29 (FB); r6:r7 A and r8:lr B when the
+ * block caches them (jit_rc), else scratch; r9 internal X RAM (Y follows
+ * at +512 words); r10 this instruction's cycles (and a scratch before
+ * that); r11 scratch.  Stack: [sp] x/single address, [sp+4] y address,
+ * [sp+8] value 1, [sp+12] value 2, then S_CNT, S_AGUV, deferred flags,
+ * S_LR.
  *------------------------------------------------------------------*/
 
 #define OFF_REG(n)	((int)(offsetof(dsp_core_t, registers) + 4 * (n)))
@@ -468,7 +507,7 @@ static void gen_ext_index(int ra, int space, uint32_t **to_helper1, uint32_t **t
 		if (space == DSP_SPACE_X) opi(OP_ORR, R11, R11, rs >> 1);
 		patch(lo, ep);
 	}
-	dpi(AL, OP_ORR, 0, R9, R9, 1 << space);
+	dpi(AL, OP_ORR, 0, R5, R5, FB(1 << space));
 }
 
 /* value of space:[address in R10] to slot (masked to 24 bits) */
@@ -479,13 +518,15 @@ static void gen_read(int space, int slot)
 	cmpi(R10, 0x100);
 	{
 		uint32_t *ext = bcc(HS);
-		ldr_x(R0, space == DSP_SPACE_X ? R6 : R7, R10);
+		if (space == DSP_SPACE_X) ldr_x(R0, R9, R10);
+		else { dpi(AL, OP_ADD, 0, R0, R10, 512); ldr_x(R0, R9, R0); }	/* (Y follows X) */
 		done1 = bcc(AL);
 		patch(ext, ep);
 	}
 	if (jit_ramext) {
 		gen_ext_index(R10, space, &helper1, &helper2);
-		ldr_x(R0, R8, R11);
+		ldr(R3, R4, offsetof(dsp_core_t, ramext));
+		ldr_x(R0, R3, R11);
 		done2 = bcc(AL);
 	}
 	helper0 = ep;
@@ -494,7 +535,7 @@ static void gen_read(int space, int slot)
 	dpi(AL, OP_MOV, 0, R0, 0, space);
 	dpr(AL, OP_MOV, 0, R1, 0, R10, 0, 0);
 	call((const void *)jit_rd);
-	dpr(AL, OP_ORR, 0, R9, R9, R1, 0, 0);
+	dpr(AL, OP_ORR, 0, R5, R5, R1, 0, FS);
 	patch(done1, ep);
 	patch(done2, ep);
 	dpi(AL, OP_BIC, 0, R0, R0, 0xff000000);
@@ -510,13 +551,15 @@ static void gen_write(int space)
 	cmpi(R10, 0x100);
 	{
 		uint32_t *ext = bcc(HS);
-		str_x(R2, space == DSP_SPACE_X ? R6 : R7, R10);
+		if (space == DSP_SPACE_X) str_x(R2, R9, R10);
+		else { dpi(AL, OP_ADD, 0, R1, R10, 512); str_x(R2, R9, R1); }
 		done1 = bcc(AL);
 		patch(ext, ep);
 	}
 	if (jit_ramext) {
 		gen_ext_index(R10, space, &helper1, &helper2);
-		str_x(R2, R8, R11);
+		ldr(R3, R4, offsetof(dsp_core_t, ramext));
+		str_x(R2, R3, R11);
 		/* jit_pver[index >> 6]++ */
 		mov32(R3, (uint32_t)(uintptr_t)jit_pver);
 		dpr(AL, OP_MOV, 0, R1, 0, R11, 1, 6);
@@ -528,7 +571,7 @@ static void gen_write(int space)
 			cmpi(R11, jit_rlo[r]);
 			below = bcc(LO);
 			cmpi(R11, jit_rhi[r]);
-			dpi(LS, OP_ORR, 0, R9, R9, JF_SMC);
+			dpi(LS, OP_ORR, 0, R5, R5, FB(JF_SMC));
 			patch(below, ep);
 		}
 		done2 = bcc(AL);
@@ -538,10 +581,15 @@ static void gen_write(int space)
 	dpi(AL, OP_MOV, 0, R0, 0, space);
 	dpr(AL, OP_MOV, 0, R1, 0, R10, 0, 0);
 	call((const void *)jit_wr);
-	dpr(AL, OP_ORR, 0, R9, R9, R0, 0, 0);
+	dpr(AL, OP_ORR, 0, R5, R5, R0, 0, FS);
 	patch(done1, ep);
 	patch(done2, ep);
 }
+
+static void part_read(int rd, uint32_t numreg);
+static void part_write(uint32_t numreg, int rs);
+static int is_part(uint32_t r);
+static void movr(int rd, int rs);
 
 /* register source (24 bits, A/B limited) to slot */
 static void gen_src(uint32_t numreg, int slot)
@@ -551,14 +599,19 @@ static void gen_src(uint32_t numreg, int slot)
 		   (dsp_pm_read_accu24, scaling mode 0) */
 		int r = numreg & 1;
 		uint32_t *ok;
-		ldr(R0, R4, OFF_REG(DSP_REG_A1 + r));
-		ldr(R1, R4, OFF_REG(DSP_REG_A2 + r));
-		dpr(AL, OP_ORR, 0, R2, R0, R1, 0, 24);
+		if (jit_rc) {
+			movr(R2, CHI(r));
+			dpi(AL, OP_BIC, 0, R0, R2, 0xff000000);
+		} else {
+			ldr(R0, R4, OFF_REG(DSP_REG_A1 + r));
+			ldr(R1, R4, OFF_REG(DSP_REG_A2 + r));
+			dpr(AL, OP_ORR, 0, R2, R0, R1, 0, 24);
+		}
 		dpr(AL, OP_MOV, 0, R3, 0, R2, 0, 8);
 		dpr(AL, OP_CMP, 1, 0, R2, R3, 2, 8);	/* cmp r2, r3, asr #8 */
 		ok = bcc(EQ);
 		dpi(AL, OP_MOV, 0, R0, 0, 0x800000);
-		dpi(AL, OP_TST, 1, 0, R1, 0x80);
+		dpi(AL, OP_TST, 1, 0, R2, 0x80000000);	/* (A2 bit 7) */
 		dpi(EQ, OP_SUB, 0, R0, R0, 1);
 		ldr(R2, R4, OFF_REG(DSP_REG_SR));
 		dpi(AL, OP_ORR, 0, R2, R2, 1 << DSP_SR_L);
@@ -566,7 +619,9 @@ static void gen_src(uint32_t numreg, int slot)
 		patch(ok, ep);
 	} else if (numreg == DSP_REG_A || numreg == DSP_REG_B) {
 		dpi(AL, OP_MOV, 0, R0, 0, numreg);
-		call((const void *)jit_accu);
+		call_sync((const void *)jit_accu);
+	} else if (is_part(numreg)) {
+		part_read(R0, numreg);
 	} else {
 		ldr(R0, R4, OFF_REG(numreg));
 	}
@@ -577,7 +632,12 @@ static void gen_src(uint32_t numreg, int slot)
 static void gen_dst(uint32_t numreg, int slot, int mask)
 {
 	ldr(R0, SP, slot);
-	if (numreg == DSP_REG_A || numreg == DSP_REG_B) {
+	if ((numreg == DSP_REG_A || numreg == DSP_REG_B) && jit_rc) {
+		int r = numreg & 1;
+		dpi(AL, OP_MOV, 0, CLO(r), 0, 0);
+		dpr(AL, OP_MOV, 0, R0, 0, R0, 0, 8);
+		dpr(AL, OP_MOV, 0, CHI(r), 0, R0, 2, 8);	/* sign extended from bit 23 */
+	} else if (numreg == DSP_REG_A || numreg == DSP_REG_B) {
 		int r = numreg & 1;
 		if (mask) dpi(AL, OP_BIC, 0, R0, R0, 0xff000000);
 		dpi(AL, OP_MOV, 0, R1, 0, 0);
@@ -597,9 +657,8 @@ static void gen_dst(uint32_t numreg, int slot, int mask)
 		strh_core(R2, offsetof(dsp_core_t, agu_pipeline_reg[1]));
 		strh_core(R1, offsetof(dsp_core_t, agu_pipeline_val[1]));
 		jit_cur_agu = numreg;
-	} else if (numreg == DSP_REG_A2 || numreg == DSP_REG_B2) {
-		dpi(AL, OP_AND, 0, R0, R0, 0xff);
-		str(R0, R4, OFF_REG(numreg));
+	} else if (is_part(numreg)) {
+		part_write(numreg, R0);
 	} else {
 		if (mask) dpi(AL, OP_BIC, 0, R0, R0, 0xff000000);
 		str(R0, R4, OFF_REG(numreg));
@@ -637,7 +696,7 @@ static int jit_alu_off;			/* NEXT_DSP_JIT_ALU=0: call Hatari for every ALU op */
 
 static void smull(int lo, int hi, int rn, int rm) { emit(0xE0C00090 | hi << 16 | lo << 12 | rm << 8 | rn); }
 
-static void acc_load(int acc, int lo, int hi)
+static void acc_load_core(int acc, int lo, int hi)
 {
 	ldr(lo, R4, OFF_REG(DSP_REG_A0 + acc));
 	dpr(AL, OP_MOV, 0, lo, 0, lo, 0, 8);
@@ -646,7 +705,7 @@ static void acc_load(int acc, int lo, int hi)
 	dpr(AL, OP_ORR, 0, hi, hi, IP, 0, 24);
 }
 
-static void acc_store(int acc, int lo, int hi)
+static void acc_store_core(int acc, int lo, int hi)
 {
 	dpr(AL, OP_MOV, 0, IP, 0, lo, 1, 8);
 	str(IP, R4, OFF_REG(DSP_REG_A0 + acc));
@@ -655,6 +714,59 @@ static void acc_store(int acc, int lo, int hi)
 	dpr(AL, OP_MOV, 0, IP, 0, hi, 1, 24);
 	str(IP, R4, OFF_REG(DSP_REG_A2 + acc));
 }
+
+static void rc_writeback(void) { acc_store_core(0, R6, R7); acc_store_core(1, R8, LR); }
+static void rc_reload(void) { acc_load_core(0, R6, R7); acc_load_core(1, R8, LR); }
+
+static void movr(int rd, int rs) { if (rd != rs) dpr(AL, OP_MOV, 0, rd, 0, rs, 0, 0); }
+
+static void acc_load(int acc, int lo, int hi)
+{
+	if (jit_rc) { movr(lo, CLO(acc)); movr(hi, CHI(acc)); }
+	else acc_load_core(acc, lo, hi);
+}
+
+static void acc_store(int acc, int lo, int hi)
+{
+	if (jit_rc) { movr(CLO(acc), lo); movr(CHI(acc), hi); }
+	else acc_store_core(acc, lo, hi);
+}
+
+/* rd = A0..B2 (numreg 8..13) */
+static void part_read(int rd, uint32_t numreg)
+{
+	int a = numreg & 1;
+	if (!jit_rc) { ldr(rd, R4, OFF_REG(numreg)); return; }
+	switch (numreg & ~1) {
+	case DSP_REG_A0: dpr(AL, OP_MOV, 0, rd, 0, CLO(a), 1, 8); break;
+	case DSP_REG_A1: dpi(AL, OP_BIC, 0, rd, CHI(a), 0xff000000); break;
+	default:         dpr(AL, OP_MOV, 0, rd, 0, CHI(a), 1, 24); break;	/* A2 */
+	}
+}
+
+/* A0..B2 = rs (masked to its width: 24 bits, A2 8) */
+static void part_write(uint32_t numreg, int rs)
+{
+	int a = numreg & 1;
+	switch (numreg & ~1) {
+	case DSP_REG_A0:
+		if (!jit_rc) { dpi(AL, OP_BIC, 0, rs, rs, 0xff000000); str(rs, R4, OFF_REG(numreg)); }
+		else dpr(AL, OP_MOV, 0, CLO(a), 0, rs, 0, 8);
+		break;
+	case DSP_REG_A1:
+		dpi(AL, OP_BIC, 0, rs, rs, 0xff000000);
+		if (!jit_rc) str(rs, R4, OFF_REG(numreg));
+		else { dpi(AL, OP_AND, 0, CHI(a), CHI(a), 0xff000000); dpr(AL, OP_ORR, 0, CHI(a), CHI(a), rs, 0, 0); }
+		break;
+	default:	/* A2 */
+		dpi(AL, OP_AND, 0, rs, rs, 0xff);
+		if (!jit_rc) str(rs, R4, OFF_REG(numreg));
+		else { dpi(AL, OP_BIC, 0, CHI(a), CHI(a), 0xff000000); dpr(AL, OP_ORR, 0, CHI(a), CHI(a), rs, 0, 24); }
+		break;
+	}
+}
+
+static int is_part(uint32_t r) { return r >= DSP_REG_A0 && r <= DSP_REG_B1; }
 
 /* hi = a 24-bit register sign extended to the accumulator's top word */
 static void reg_hi(int hi, uint32_t numreg)
@@ -794,12 +906,13 @@ static int gen_alu_native(uint32_t b)
 				dpi(AL, OP_RSC, 0, R11, R11, 0);
 			}
 		} else {
-			acc_load(d, R0, R1);
-			dpr(AL, minus ? OP_SUB : OP_ADD, 1, R0, R0, R10, 0, 0);
-			dpr(AL, minus ? OP_SBC : OP_ADC, 1, R1, R1, R11, 0, 0);
+			int ra = jit_rc ? CLO(d) : R0, rb = jit_rc ? CHI(d) : R1;	/* (in place when cached) */
+			if (!jit_rc) acc_load(d, R0, R1);
+			dpr(AL, minus ? OP_SUB : OP_ADD, 1, ra, ra, R10, 0, 0);
+			dpr(AL, minus ? OP_SBC : OP_ADC, 1, rb, rb, R11, 0, 0);
 			if (jit_lazy) lazy_vl();
 			else dpi(VS, OP_ORR, 0, R2, R2, F_V | F_L);
-			lo = R0; hi = R1;
+			lo = ra; hi = rb;
 		}
 		if (kind & 1) gen_rnd(lo, hi);
 		acc_store(d, lo, hi);
@@ -811,6 +924,7 @@ static int gen_alu_native(uint32_t b)
 
 	switch (b) {
 	case 0x01: case 0x09:	/* TFR B,A / A,B */
+		if (jit_rc) { movr(CLO(d), CLO(!d)); movr(CHI(d), CHI(!d)); return 1; }
 		ldr(R0, R4, OFF_REG(DSP_REG_A0 + !d));
 		ldr(R1, R4, OFF_REG(DSP_REG_A1 + !d));
 		ldr(R2, R4, OFF_REG(DSP_REG_A2 + !d));
@@ -835,10 +949,15 @@ static int gen_alu_native(uint32_t b)
 		str(R2, R4, OFF_REG(DSP_REG_SR));
 		return 1;
 	case 0x13: case 0x1b:	/* CLR */
-		dpi(AL, OP_MOV, 0, R0, 0, 0);
-		str(R0, R4, OFF_REG(DSP_REG_A0 + d));
-		str(R0, R4, OFF_REG(DSP_REG_A1 + d));
-		str(R0, R4, OFF_REG(DSP_REG_A2 + d));
+		if (jit_rc) {
+			dpi(AL, OP_MOV, 0, CLO(d), 0, 0);
+			dpi(AL, OP_MOV, 0, CHI(d), 0, 0);
+		} else {
+			dpi(AL, OP_MOV, 0, R0, 0, 0);
+			str(R0, R4, OFF_REG(DSP_REG_A0 + d));
+			str(R0, R4, OFF_REG(DSP_REG_A1 + d));
+			str(R0, R4, OFF_REG(DSP_REG_A2 + d));
+		}
 		sr_load(R2, F_V | F_Z | F_N | F_U | F_E);
 		dpi(AL, OP_ORR, 0, R2, R2, F_U | F_Z);
 		str(R2, R4, OFF_REG(DSP_REG_SR));
@@ -914,7 +1033,7 @@ static void gen_alu(uint32_t inst)
 	dsp_emul_t f = opcodes_alu[inst & 0xff];
 	if (f == dsp_move) return;
 	if (gen_alu_native(inst & 0xff)) return;
-	call((const void *)f);
+	call_sync((const void *)f);
 }
 
 static int jit_dst_ok(uint32_t r)  { return r >= DSP_REG_X0 && r <= DSP_REG_N7; }	/* X0..B, R0..N7 */
@@ -974,6 +1093,19 @@ static void gen_inst(uint32_t inst)
 		ldrb_x(R0, IP, R0);
 		dpi(AL, OP_CMP, 1, 0, R0, 0);
 		skip = bcc(EQ);
+		if (jit_rc) {
+			if (s1 == DSP_REG_A || s1 == DSP_REG_B) {
+				movr(CLO(d1), CLO(s1 & 1));
+				movr(CHI(d1), CHI(s1 & 1));
+			} else {
+				ldr(R2, R4, OFF_REG(s1));
+				dpi(AL, OP_MOV, 0, CLO(d1), 0, 0);
+				dpr(AL, OP_MOV, 0, R2, 0, R2, 0, 8);
+				dpr(AL, OP_MOV, 0, CHI(d1), 0, R2, 2, 8);
+			}
+			patch(skip, ep);
+			return;
+		}
 		if (s1 == DSP_REG_A || s1 == DSP_REG_B) {
 			ldr(R1, R4, OFF_REG(DSP_REG_A0 + (s1 & 1)));
 			ldr(R2, R4, OFF_REG(DSP_REG_A1 + (s1 & 1)));
@@ -1245,6 +1377,8 @@ static int jit_init(void)
 	if (e && atoi(e) > 0 && atoi(e) < JIT_MAX) jit_max = atoi(e);
 	e = getenv("NEXT_DSP_JIT_DBG");
 	if (e && *e >= '1' && *e <= '2') jit_dbg = *e - '0';	/* 2: also exit after every deferred-flags op */
+	e = getenv("NEXT_DSP_JIT_RC");
+	if (e && *e == '0') jit_rc_off = 1;
 	e = getenv("NEXT_DSP_JIT_ALU");
 	if (e && *e == '0') jit_alu_off = 1;
 	jit_mem = mmap(NULL, JIT_CODE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1400,6 +1534,7 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 	b->code = NULL;
 	b->nw = 0;
 	b->scal = jit_scal = (dsp_core.registers[DSP_REG_SR] >> DSP_SR_S0) & 3;
+	jit_rc = jit_scal == 0 && !jit_alu_off && !jit_rc_off;
 	b->eagu = eagu;
 	dsp_jit_stats[3]++;
 	jit_npv = 0;
@@ -1522,10 +1657,11 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 	emit(0xE92D4FF8);				/* push {r3-r11, lr} */
 	dpi(AL, OP_SUB, 0, SP, SP, S_FRAME);
 	mov32(R4, (uint32_t)(uintptr_t)&dsp_core);
-	mov32(R6, (uint32_t)(uintptr_t)&dsp_core.ramint[DSP_SPACE_X][0]);
-	mov32(R7, (uint32_t)(uintptr_t)&dsp_core.ramint[DSP_SPACE_Y][0]);
 	_Static_assert(offsetof(dsp_core_t, ramext) < 4096, "ramext offset");
-	ldr(R8, R4, offsetof(dsp_core_t, ramext));
+	_Static_assert(offsetof(dsp_core_t, registers) + 4 * 64 < 4096, "registers offset");
+	_Static_assert(offsetof(dsp_core_t, ramint[DSP_SPACE_Y][0]) - offsetof(dsp_core_t, ramint[DSP_SPACE_X][0]) == 512 * 4, "Y after X");
+	mov32(R9, (uint32_t)(uintptr_t)&dsp_core.ramint[DSP_SPACE_X][0]);
+	if (jit_rc) rc_reload();
 	dpi(AL, OP_MOV, 0, R5, 0, 0);
 	str(R5, SP, S_CNT);
 	if (eagu && (ik[0] == K_INT || ik[0] == K_REP || ik[0] == K_DO || ik[0] == K_TAIL)) {
@@ -1561,7 +1697,7 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 			   the PC and length it left in jit_out */
 			mov32(R0, iw[i]);
 			mov32(R1, ia[i]);
-			call((const void *)jit_tail);
+			call_sync((const void *)jit_tail);
 			dpr(AL, OP_MOV, 0, R10, 0, R0, 0, 0);
 			dpr(AL, OP_ADD, 0, R5, R5, R10, 0, 0);
 			jit_prev_agu = 0;
@@ -1570,10 +1706,11 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 		if (ik[i] == K_INT || ik[i] == K_DO || ik[i] == K_REP) {
 			mov32(R0, iw[i]);
 			mov32(R1, ia[i]);
-			call((const void *)jit_interp);
+			call_sync((const void *)jit_interp);
 			ubfx(R10, R0, 0, 16);
-			dpr(AL, OP_MOV, 0, R9, 0, R0, 1, 16);	/* lsr #16 */
-			if (!ext_code) dpi(AL, OP_BIC, 0, R9, R9, JF_SMC);
+			dpr(AL, OP_MOV, 0, R1, 0, R0, 1, 16);	/* lsr #16: flags */
+			if (!ext_code) dpi(AL, OP_BIC, 0, R1, R1, JF_SMC);
+			dpr(AL, OP_ORR, 0, R5, R5, R1, 0, FS);
 		} else {
 			if (jit_prev_agu) {
 				/* the previous instruction's staged R/N move is spent:
@@ -1594,15 +1731,16 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 				dpi(AL, OP_MOV, 0, R10, 0, 2 + jit_xcyc);
 			} else {
 				uint32_t *noext;
-				dpi(AL, OP_MOV, 0, R9, 0, ia[i] + il[i] - 1 >= 0x200 ? 4 : 0);	/* P fetch external (either word) */
+				if (ia[i] + il[i] - 1 >= 0x200) dpi(AL, OP_ORR, 0, R5, R5, FB(4));	/* P fetch external (either word) */
 				jit_lazy = lz; jit_xcyc = 0; jit_w2 = iw2[i];
 				gen_inst(iw[i]);
 				jit_lazy = 0;
 				/* cycles: 2 + ea extra + wait states (none without an external X/Y access) */
 				dpi(AL, OP_MOV, 0, R10, 0, 2 + jit_xcyc);
-				dpi(AL, OP_TST, 1, 0, R9, 3);
+				dpi(AL, OP_TST, 1, 0, R5, FB(3));
 				noext = bcc(EQ);
-				dpi(AL, OP_AND, 0, R0, R9, 7);
+				dpr(AL, OP_MOV, 0, R0, 0, R5, 1, FS);
+				dpi(AL, OP_AND, 0, R0, R0, 7);
 				mov32(IP, (uint32_t)(uintptr_t)jit_wait);
 				ldrb_x(R0, IP, R0);
 				dpi(AL, OP_ADD, 0, R10, R0, 2 + jit_xcyc);
@@ -1613,7 +1751,7 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 		if (jit_dbg) {
 			mov32(R0, i);
 			dpr(AL, OP_MOV, 0, R1, 0, R10, 0, 0);
-			dpr(AL, OP_MOV, 0, R2, 0, R5, 0, 0);
+			ubfx(R2, R5, 0, FS);
 			call((const void *)jit_dbg_rec);
 		}
 		if (ik[i] == K_JMP) {
@@ -1640,9 +1778,11 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 		if (lz && jit_dbg == 2) {
 			exit_if_lz(AL, i + 1, epc[i], elen[i], lz);
 		} else if (ik[i] != K_NAT || jit_mem_inst(iw[i])) {
-			dpi(AL, OP_TST, 1, 0, R9, JF_EXIT);
+			dpi(AL, OP_TST, 1, 0, R5, FB(JF_EXIT));
 			exit_if_lz(NE, i + 1, epc[i], elen[i], lz);
 		}
+		if (ik[i] != K_NAT || jit_mem_inst(iw[i]))
+			dpi(AL, OP_BIC, 0, R5, R5, FB_MASK);	/* (clean for the next instruction) */
 		jit_prev_agu = ik[i] == K_NAT ? jit_cur_agu : 0;
 		if (ik[i] == K_REP) call((const void *)jit_rep_post);
 		if (irep[i]) {
@@ -1744,6 +1884,8 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 		}
 		epi = ep;
 		for (i = 0; i <= jit_nxr; i++) patch(to_epi[i], epi);
+		if (jit_rc) rc_writeback();
+		dpi(AL, OP_BIC, 0, R5, R5, FB_MASK);
 		/* epilogue: jit_out = {n, pc, len, cycles}; instr_cycle = r10 */
 		mov32(IP, (uint32_t)(uintptr_t)&jit_out);
 		str(R0, IP, 0);
