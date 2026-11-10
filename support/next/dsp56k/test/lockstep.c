@@ -20,6 +20,7 @@
 	void p##dsp_core_config_ramext(uint32_t *, uint32_t); void p##dsp56k_execute_instruction(void); int p##dsp56k_jit_step(uint32_t *); void p##dsp56k_jit_flush(void);
 CORE(ref_)
 CORE(new_)
+extern uint32_t new_dsp_jit_dbg[68];	/* NEXT_DSP_JIT_DBG=1: the new side's cycles per instruction of the last block */
 
 static void hi(int x) { (void)x; }
 static uint64_t s;
@@ -64,6 +65,9 @@ static int cmp_state(uint32_t pc0, uint32_t inst)
 static int use_jit;	/* LOCKSTEP_JIT=1: new core runs dsp56k_jit_step (blocks) */
 static long blocks, in_blocks;
 
+static uint32_t lp[64], lw[64], lc[64];
+static int lk;
+
 static int step(void)
 {
 	uint32_t pc0 = ref_dsp_core.pc;
@@ -71,23 +75,28 @@ static int step(void)
 	if (use_jit) {
 		uint32_t cn = 0, cr = 0;
 		int k = new_dsp56k_jit_step(&cn);
-		static uint32_t lp[64], lw[64], lc[64];
+		lk = k;
 		for (int i = 0; i < k; i++) {
 			uint32_t p = ref_dsp_core.pc;
 			if (i < 64) { lp[i] = p; lw[i] = p < 0x200 ? ref_dsp_core.ramint[2][p] : ram_r[p & 32767]; }
 			ref_dsp56k_execute_instruction(); cr += ref_dsp_core.instr_cycle;
 			if (i < 64) lc[i] = ref_dsp_core.instr_cycle;
 		}
-		if (cn != cr) for (int i = 0; i < k && i < 64; i++) printf("  ref %04x %06x %u cycles\n", lp[i], lw[i], lc[i]);
+		if (cn != cr) for (int i = 0; i < k && i < 64; i++)
+			printf("  ref %04x %06x %u cycles  (new %u, total %u)\n", lp[i], lw[i], lc[i], i < 32 ? new_dsp_jit_dbg[i] : 0, i < 32 ? new_dsp_jit_dbg[32 + i] : 0);
 		steps += k;
 		if (k > 1) { blocks++; in_blocks += k; }
+		if (cn != cr) printf("  new block %04x: cycles %u n %u pc %04x len %u\n", new_dsp_jit_dbg[67], new_dsp_jit_dbg[64], new_dsp_jit_dbg[65], new_dsp_jit_dbg[66] & 0xffff, new_dsp_jit_dbg[66] >> 16);
 		if (cn != cr) { printf("CYCLES MISMATCH at step %ld (block of %d from %04x): ref %u new %u\n", steps, k, pc0, cr, cn); fails++; return 1; }
 	} else {
 		ref_dsp56k_execute_instruction();
 		new_dsp56k_execute_instruction();
 		steps++;
 	}
-	if (cmp_state(pc0, inst)) return 1;
+	if (cmp_state(pc0, inst)) {
+		if (use_jit) for (int i = 0; i < lk && i < 64; i++) printf("  ref %04x %06x %u cycles\n", lp[i], lw[i], lc[i]);
+		return 1;
+	}
 	if (!(steps & 63)) cmp_mem();
 	return fails > 0;
 }

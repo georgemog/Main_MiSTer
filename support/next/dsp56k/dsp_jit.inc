@@ -31,6 +31,13 @@
  * mode it was compiled for).  NEXT_DSP_JIT_ALU=0 calls Hatari's functions
  * for every ALU op instead.
  *
+ * Step 3: parallel moves to R/N (register, memory, #xx, R update) are
+ * native, with the one-instruction AGU delay resolved at compile time
+ * (jit_prev_agu); nop and Tcc S1,D1 are native; and any other instruction
+ * except a lone one can end a block as its tail, through Hatari's handler
+ * (jit_tail), so jumps, bit tests, movep, do and so on no longer need the
+ * interpreter's full dispatch.
+ *
  * Code changes: a block keeps the P words it was compiled from and checks
  * them on entry.  Changing the external RAM (pointer or size) drops all.
  */
@@ -61,8 +68,8 @@ typedef struct jit_block_s {
 	uint16_t clip;			/* compiled to stop at this LA (0xffff: none) */
 	uint16_t nw;			/* P words */
 	uint16_t scal;			/* SR scaling bits it was compiled for */
-	const uint32_t *pv[2];		/* code version counters of its pages */
-	uint32_t ver[2];
+	const uint32_t *pv[3];		/* code version counters of its pages */
+	uint32_t ver[3];
 	void (*code)(void);
 	const uint32_t *src[2 * JIT_MAX];	/* where each P word came from */
 	uint32_t word[2 * JIT_MAX];
@@ -71,6 +78,24 @@ typedef struct jit_block_s {
 static struct { uint32_t n, pc, len, cycles; } jit_out;
 static uint8_t *jit_mem, *jit_ptr;
 static jit_block_t *jit_tab[JIT_HASH];
+static uint8_t jit_cc[16][128];		/* condition code x SR bits 0..6 (dsp_calc_cc) */
+
+static int jit_cc_eval(int cc, uint32_t sr)
+{
+	int c = sr & 1, v = (sr >> 1) & 1, z = (sr >> 2) & 1, n = (sr >> 3) & 1;
+	int u = (sr >> 4) & 1, e = (sr >> 5) & 1, l = (sr >> 6) & 1, r = 0;
+	switch (cc & 7) {
+	case 0: r = !c; break;
+	case 1: r = !(n ^ v); break;
+	case 2: r = !z; break;
+	case 3: r = !n; break;
+	case 4: r = !(z | (!u & !e)); break;
+	case 5: r = !e; break;
+	case 6: r = !l; break;
+	case 7: r = !(z | (n ^ v)); break;
+	}
+	return cc & 8 ? !r : r;
+}
 static jit_block_t *jit_pool;
 static int jit_pool_n;
 #define JIT_POOL	8192
@@ -238,6 +263,29 @@ static void bto(int cond, uint32_t *target)
 #define S_VAL1	8
 #define S_VAL2	12
 #define S_CNT	16	/* instructions of earlier DO-loop passes */
+#define S_AGUV	20	/* old value of the R/N register the previous instruction moved to */
+
+/* AGU pipeline at compile time: a parallel move to R/N takes effect for
+   addressing one instruction later (Hatari's agu_pipeline).  jit_prev_agu
+   is the register the previous instruction in the block moved to (0:
+   none); its address computations use the old value, kept in S_AGUV.
+   The move also stages agu_pipeline_reg/val[1] in dsp_core, which the
+   next native instruction clears, jit_interp/jit_tail consume, and
+   jit_post moves on when the block ends after it. */
+static uint32_t jit_prev_agu, jit_cur_agu;
+
+static void strh_core(int rt, uint32_t off)
+{
+	if (off < 256) emit(0xE1C000B0 | R4 << 16 | rt << 12 | (off >> 4 & 0xf) << 8 | (off & 0xf));
+	else { mov32(IP, off); emit(0xE18000B0 | R4 << 16 | rt << 12 | IP); }
+}
+
+/* R[n] / N[n] as the address unit sees them */
+static void ldr_rn(int rd, uint32_t numreg)
+{
+	if (jit_prev_agu == numreg) ldr(rd, SP, S_AGUV);
+	else ldr(rd, R4, OFF_REG(numreg));
+}
 #define JIT_LOOP_BUDGET	256	/* instructions before a looping block returns */
 
 /* address of R[n] per ea mode (1 (Rn)+Nn, 0 (Rn)-Nn, 2 (Rn)-, 3 (Rn)+, 4 (Rn)) to slot */
@@ -246,15 +294,15 @@ static void gen_ea(uint32_t ea_mode, int slot)
 	uint32_t mode = (ea_mode >> 3) & 7, n = ea_mode & 7;
 	uint32_t *slow, *done;
 
-	ldr(R10, R4, OFF_REG(DSP_REG_R0 + n));
+	ldr_rn(R10, DSP_REG_R0 + n);
 	str(R10, SP, slot);
 	if (mode == 4) return;
 	ldr(R11, R4, OFF_REG(DSP_REG_M0 + n));
 	cmpi(R11, 0xffff);
 	slow = bcc(NE);
 	switch (mode) {
-	case 0: ldr(R1, R4, OFF_REG(DSP_REG_N0 + n)); dpr(AL, OP_SUB, 0, R0, R10, R1, 0, 0); break;
-	case 1: ldr(R1, R4, OFF_REG(DSP_REG_N0 + n)); dpr(AL, OP_ADD, 0, R0, R10, R1, 0, 0); break;
+	case 0: ldr_rn(R1, DSP_REG_N0 + n); dpr(AL, OP_SUB, 0, R0, R10, R1, 0, 0); break;
+	case 1: ldr_rn(R1, DSP_REG_N0 + n); dpr(AL, OP_ADD, 0, R0, R10, R1, 0, 0); break;
 	case 2: dpi(AL, OP_SUB, 0, R0, R10, 1); break;
 	case 3: dpi(AL, OP_ADD, 0, R0, R10, 1); break;
 	}
@@ -265,8 +313,8 @@ static void gen_ea(uint32_t ea_mode, int slot)
 	dpi(AL, OP_MOV, 0, R0, 0, n);
 	dpr(AL, OP_MOV, 0, R1, 0, R10, 0, 0);
 	switch (mode) {
-	case 0: ldr(R2, R4, OFF_REG(DSP_REG_N0 + n)); dpi(AL, OP_RSB, 0, R2, R2, 0); break;
-	case 1: ldr(R2, R4, OFF_REG(DSP_REG_N0 + n)); break;
+	case 0: ldr_rn(R2, DSP_REG_N0 + n); dpi(AL, OP_RSB, 0, R2, R2, 0); break;
+	case 1: ldr_rn(R2, DSP_REG_N0 + n); break;
 	case 2: dpi(AL, OP_MVN, 0, R2, 0, 0); break;
 	case 3: dpi(AL, OP_MOV, 0, R2, 0, 1); break;
 	}
@@ -394,6 +442,20 @@ static void gen_dst(uint32_t numreg, int slot, int mask)
 		dpi(AL, OP_TST, 1, 0, R0, 0x800000);
 		dpi(NE, OP_MOV, 0, R1, 0, 0xff);
 		str(R1, R4, OFF_REG(DSP_REG_A2 + r));
+	} else if (numreg >= DSP_REG_R0 && numreg <= DSP_REG_N7) {
+		/* delayed for addressing: stage the old value (dsp_write_reg) */
+		ldr(R1, R4, OFF_REG(numreg));
+		ubfx(R1, R1, 0, 16);		/* (agu_pipeline_val is 16 bits) */
+		str(R1, SP, S_AGUV);
+		ubfx(R0, R0, 0, 16);
+		str(R0, R4, OFF_REG(numreg));
+		dpi(AL, OP_MOV, 0, R2, 0, numreg);
+		strh_core(R2, offsetof(dsp_core_t, agu_pipeline_reg[1]));
+		strh_core(R1, offsetof(dsp_core_t, agu_pipeline_val[1]));
+		jit_cur_agu = numreg;
+	} else if (numreg == DSP_REG_A2 || numreg == DSP_REG_B2) {
+		dpi(AL, OP_AND, 0, R0, R0, 0xff);
+		str(R0, R4, OFF_REG(numreg));
 	} else {
 		if (mask) dpi(AL, OP_BIC, 0, R0, R0, 0xff000000);
 		str(R0, R4, OFF_REG(numreg));
@@ -419,6 +481,12 @@ static void gen_dst(uint32_t numreg, int slot, int mask)
 #define F_L	0x40
 
 static int jit_scal;			/* SR scaling bits of the block being compiled */
+static int jit_dbg;			/* NEXT_DSP_JIT_DBG=1: record each instruction's cycles (tests) */
+uint32_t dsp_jit_dbg[2 * JIT_MAX + 4];	/* [i]: cycles of the block's instruction i, [JIT_MAX + i] the block's cycles so far */
+static void jit_dbg_rec(uint32_t i, uint32_t cycles, uint32_t bits)
+{
+	if (i < JIT_MAX) { dsp_jit_dbg[i] = cycles; dsp_jit_dbg[JIT_MAX + i] = bits; }
+}
 static int jit_alu_off;			/* NEXT_DSP_JIT_ALU=0: call Hatari for every ALU op */
 
 static void smull(int lo, int hi, int rn, int rm) { emit(0xE0C00090 | hi << 16 | lo << 12 | rm << 8 | rn); }
@@ -616,21 +684,23 @@ static void gen_alu(uint32_t inst)
 	call((const void *)f);
 }
 
-static int jit_dst_ok(uint32_t r)  { return (r >= DSP_REG_X0 && r <= DSP_REG_Y1) || r == DSP_REG_A || r == DSP_REG_B; }
+static int jit_dst_ok(uint32_t r)  { return r >= DSP_REG_X0 && r <= DSP_REG_N7; }	/* X0..B, R0..N7 */
+static int jit_tcc_ok(uint32_t inst) { return (inst & 0xff0f87) == 0x020000 && registers_tcc[(inst >> 3) & 15][0] != DSP_REG_NULL; }
 static int jit_src_ok(uint32_t r)  { return (r >= DSP_REG_X0 && r <= DSP_REG_B) || (r >= DSP_REG_R0 && r <= DSP_REG_N7); }
 
 /* can this word be compiled? (mirrors the gen_inst cases) */
 static int jit_native(uint32_t inst)
 {
-	if (inst < 0x100000) return 0;
+	if (inst == 0) return 1;				/* nop */
+	if (inst < 0x100000) return jit_tcc_ok(inst);
 	if (opcodes_alu[inst & 0xff] == dsp_undefined) return 0;
 	switch ((inst >> 20) & 0xf) {
-	case 2:
+	case 2: case 3:
 		if ((inst & 0xffff00) == 0x200000) return 1;
-		if ((inst & 0xffe000) == 0x204000) return 0;
+		if ((inst & 0xffe000) == 0x204000) return 1;	/* R update */
 		if ((inst & 0xfc0000) == 0x200000)
 			return jit_src_ok((inst >> 13) & 0x1f) && jit_dst_ok((inst >> 8) & 0x1f);
-		return 0;
+		return jit_dst_ok((inst >> 16) & 0x1f);		/* #xx,D */
 	case 4:
 		if ((inst & 0xf40000) == 0x400000) return 0;
 		/* fall through */
@@ -651,10 +721,48 @@ static void gen_inst(uint32_t inst)
 	static const uint8_t xreg[4] = { DSP_REG_X0, DSP_REG_X1, DSP_REG_A, DSP_REG_B };
 	static const uint8_t yreg[4] = { DSP_REG_Y0, DSP_REG_Y1, DSP_REG_A, DSP_REG_B };
 
+	if (inst == 0) return;					/* nop */
+	if (inst < 0x100000) {					/* Tcc S1,D1 */
+		uint32_t s1 = registers_tcc[(inst >> 3) & 15][0], d1 = registers_tcc[(inst >> 3) & 15][1] & 1;
+		uint32_t *skip;
+		ldr(R0, R4, OFF_REG(DSP_REG_SR));
+		dpi(AL, OP_AND, 0, R0, R0, 0x7f);
+		mov32(IP, (uint32_t)(uintptr_t)jit_cc[(inst >> 12) & 15]);
+		ldrb_x(R0, IP, R0);
+		dpi(AL, OP_CMP, 1, 0, R0, 0);
+		skip = bcc(EQ);
+		if (s1 == DSP_REG_A || s1 == DSP_REG_B) {
+			ldr(R1, R4, OFF_REG(DSP_REG_A0 + (s1 & 1)));
+			ldr(R2, R4, OFF_REG(DSP_REG_A1 + (s1 & 1)));
+			ldr(R3, R4, OFF_REG(DSP_REG_A2 + (s1 & 1)));
+		} else {
+			dpi(AL, OP_MOV, 0, R1, 0, 0);
+			ldr(R2, R4, OFF_REG(s1));
+			dpi(AL, OP_MOV, 0, R3, 0, 0);
+			dpi(AL, OP_TST, 1, 0, R2, 0x800000);
+			dpi(NE, OP_MOV, 0, R3, 0, 0xff);
+		}
+		str(R1, R4, OFF_REG(DSP_REG_A0 + d1));
+		str(R2, R4, OFF_REG(DSP_REG_A1 + d1));
+		str(R3, R4, OFF_REG(DSP_REG_A2 + d1));
+		patch(skip, ep);
+		return;
+	}
+
 	switch ((inst >> 20) & 0xf) {
-	case 2:
+	case 2: case 3:
 		if ((inst & 0xffff00) == 0x200000) {
 			gen_alu(inst);
+		} else if ((inst & 0xffe000) == 0x204000) {	/* R update, then the ALU */
+			gen_ea((inst >> 8) & 0x1f, S_ADDR1);
+			gen_alu(inst);
+		} else if ((inst & 0xfc0000) != 0x200000) {	/* #xx,D after the ALU */
+			uint32_t dst = (inst >> 16) & 0x1f, v = (inst >> 8) & 0xff;
+			gen_alu(inst);
+			if ((dst >= DSP_REG_X0 && dst <= DSP_REG_Y1) || dst == DSP_REG_A || dst == DSP_REG_B) v <<= 16;
+			mov32(R0, v);
+			str(R0, SP, S_VAL1);
+			gen_dst(dst, S_VAL1, 0);
 		} else {
 			uint32_t src = (inst >> 13) & 0x1f, dst = (inst >> 8) & 0x1f;
 			gen_src(src, S_VAL1);
@@ -729,6 +837,11 @@ static uint32_t jit_interp(uint32_t inst, uint32_t addr)
 	access_to_ext_memory = addr >= 0x200 ? 1 << DSP_SPACE_P : 0;
 	dsp_core.agu_move_indirect_instr = 0;
 	jit_periph = jit_extw = 0;
+	/* the previous (native) instruction's delayed R/N move, as the
+	   interpreter's end of instruction would have staged it */
+	dsp_core.agu_pipeline_reg[0] = dsp_core.agu_pipeline_reg[1];
+	dsp_core.agu_pipeline_val[0] = dsp_core.agu_pipeline_val[1];
+	dsp_core.agu_pipeline_reg[1] = 0;
 	if (inst < 0x100000) {
 		value = (inst >> 11) & (BITMASK(6) << 3);
 		value += (inst >> 5) & BITMASK(3);
@@ -745,17 +858,55 @@ static uint32_t jit_interp(uint32_t inst, uint32_t addr)
 	}
 	if (jit_periph || dsp_core.agu_pipeline_reg[1]) f |= JF_PERIPH;
 	if (jit_extw) f |= JF_SMC;
+	dsp_core.agu_pipeline_reg[0] = 0;
 	return dsp_core.instr_cycle | f << 16;
 }
 
-/* 1: compiled; 2: through jit_interp inside a block; 0: ends blocks */
+/* any other instruction, as the block's last: Hatari's handler, leaving
+   the PC and length it sets in jit_out for jit_post (which then does the
+   interpreter's end of instruction: REP/DO, AGU pipeline, interrupts);
+   returns its cycles */
+static uint32_t jit_tail(uint32_t inst, uint32_t addr)
+{
+	uint32_t value;
+
+	dsp_core.pc = addr;
+	cur_inst = inst;
+	cur_inst_len = 1;
+	dsp_core.instr_cycle = 2;
+	access_to_ext_memory = addr >= 0x200 ? 1 << DSP_SPACE_P : 0;
+	dsp_core.agu_move_indirect_instr = 0;
+	dsp_core.agu_pipeline_reg[0] = dsp_core.agu_pipeline_reg[1];
+	dsp_core.agu_pipeline_val[0] = dsp_core.agu_pipeline_val[1];
+	dsp_core.agu_pipeline_reg[1] = 0;
+	if (inst < 0x100000) {
+		value = (inst >> 11) & (BITMASK(6) << 3);
+		value += (inst >> 5) & BITMASK(3);
+		opcodes8h[value]();
+	} else {
+		opcodes_parmove[(inst >> 20) & BITMASK(4)]();
+	}
+	if (access_to_ext_memory != 0) {
+		value  = (access_to_ext_memory >> DSP_SPACE_X) & 1;
+		value += (access_to_ext_memory >> DSP_SPACE_Y) & 1;
+		value += (access_to_ext_memory >> DSP_SPACE_P) & 1;
+		if (value > 1)
+			dsp_core.instr_cycle += (value - 1) * 2;
+	}
+	jit_out.pc = dsp_core.pc;
+	jit_out.len = cur_inst_len;
+	return dsp_core.instr_cycle;
+}
+
+/* 1: compiled; 2: through jit_interp inside a block; 3: through jit_tail,
+   as a block's last instruction; 0: not in blocks */
 static int jit_kind(uint32_t inst)
 {
 	if (jit_native(inst)) return 1;
-	if (inst == 0) return 2;				/* nop */
 	if (inst < 0x100000) {
 		uint32_t value = ((inst >> 11) & (BITMASK(6) << 3)) + ((inst >> 5) & BITMASK(3));
-		return opcodes8h[value] == dsp_tcc ? 2 : 0;
+		if (opcodes8h[value] == dsp_tcc) return 2;
+		return opcodes8h[value] == dsp_undefined ? 0 : 3;
 	}
 	if (opcodes_alu[inst & 0xff] == dsp_undefined) return 0;
 	return 2;
@@ -804,10 +955,14 @@ static int jit_init(void)
 	if (e && *e == '0') { jit_off = 1; return -1; }
 	e = getenv("NEXT_DSP_JIT_MAX");
 	if (e && atoi(e) > 0 && atoi(e) < JIT_MAX) jit_max = atoi(e);
+	e = getenv("NEXT_DSP_JIT_DBG");
+	if (e && *e == '1') jit_dbg = 1;
 	e = getenv("NEXT_DSP_JIT_ALU");
 	if (e && *e == '0') jit_alu_off = 1;
 	jit_mem = mmap(NULL, JIT_CODE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (jit_mem == MAP_FAILED) { jit_mem = NULL; jit_off = 1; return -1; }
+	for (int cc = 0; cc < 16; cc++)
+		for (int sr = 0; sr < 128; sr++) jit_cc[cc][sr] = jit_cc_eval(cc, sr);
 	jit_pool = calloc(JIT_POOL, sizeof(jit_block_t));
 	if (!jit_pool) { jit_off = 1; return -1; }
 	jit_flush();
@@ -844,6 +999,14 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip)
 		w = *s & BITMASK(24);
 		k = jit_kind(w);
 		if (!k) break;
+		if (k == 3) {
+			/* a tail: its length is the handler's; count two words for
+			   the code pages and the self-modification range */
+			ia[n] = a; il[n] = 2; ik[n] = k; iw[n] = w;
+			b->src[b->nw] = s; b->word[b->nw++] = w;
+			n++;
+			break;
+		}
 		len = jit_len(w);
 		if (len == 2 && !(s2 = jit_psrc(a + 1))) break;
 		b->src[b->nw] = s; b->word[b->nw++] = w;
@@ -853,15 +1016,18 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip)
 		if (clip >= a && clip < a + len) break;
 		a += len;
 	}
+	/* a lone tail is cheaper through the interpreter (a polling loop) */
+	if (n == 1 && ik[0] == 3) n = 0;
 	b->n = n;
 	b->last = n ? ia[n - 1] : pc;
-	/* pages: the first and last word's (a block spans at most two) */
+	/* pages: the first word's, the last instruction's and the last word's
+	   (the words up to the last instruction span at most two) */
 	{
 		uint32_t endw = n ? ia[n - 1] + il[n - 1] - 1 : pc;
 		b->pv[0] = jit_pver_of(pc);
-		b->pv[1] = jit_pver_of(endw);
-		b->ver[0] = *b->pv[0];
-		b->ver[1] = *b->pv[1];
+		b->pv[1] = jit_pver_of(n ? ia[n - 1] : pc);
+		b->pv[2] = jit_pver_of(endw);
+		for (i = 0; i < 3; i++) b->ver[i] = *b->pv[i];
 	}
 	if (!n) {
 		const uint32_t *s = jit_psrc(pc);
@@ -873,7 +1039,7 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip)
 
 	/* external RAM indices of the block's code */
 	jit_lo = 1; jit_hi = 0;
-	ext_code = jit_ramext && a > 0x200;
+	ext_code = jit_ramext && ia[n - 1] + il[n - 1] - 1 >= 0x200;	/* (a word in external RAM) */
 	if (ext_code) {
 		uint32_t f = pc < 0x200 ? 0x200 : pc, l = ia[n - 1] + il[n - 1] - 1;
 		jit_lo = f & (jit_ramsize - 1);
@@ -893,7 +1059,21 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip)
 	str(R5, SP, S_CNT);
 	body = ep;
 
+	jit_prev_agu = 0;
 	for (i = 0; i < n; i++) {
+		jit_cur_agu = 0;
+		if (ik[i] == 3) {
+			/* the tail: Hatari's handler; falls through to the end with
+			   the PC and length it left in jit_out */
+			mov32(R0, iw[i]);
+			mov32(R1, ia[i]);
+			call((const void *)jit_tail);
+			dpr(AL, OP_MOV, 0, R10, 0, R0, 0, 0);
+			dpr(AL, OP_ADD, 0, R5, R5, R10, 0, 0);
+			exits[i] = NULL;
+			jit_prev_agu = 0;
+			break;
+		}
 		if (ik[i] == 2) {
 			mov32(R0, iw[i]);
 			mov32(R1, ia[i]);
@@ -902,6 +1082,15 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip)
 			dpr(AL, OP_MOV, 0, R9, 0, R0, 1, 16);	/* lsr #16 */
 			if (!ext_code) dpi(AL, OP_BIC, 0, R9, R9, JF_SMC);
 		} else {
+			if (jit_prev_agu) {
+				/* the previous instruction's staged R/N move is spent:
+				   reg[1] = 0, val[0] = val[1] (reg[0] stays 0, as after
+				   the interpreter's next end of instruction) */
+				dpi(AL, OP_MOV, 0, R0, 0, 0);
+				strh_core(R0, offsetof(dsp_core_t, agu_pipeline_reg[1]));
+				ldr(R0, SP, S_AGUV);
+				strh_core(R0, offsetof(dsp_core_t, agu_pipeline_val[0]));
+			}
 			dpi(AL, OP_MOV, 0, R9, 0, ia[i] >= 0x200 ? 4 : 0);	/* P fetch external */
 			gen_inst(iw[i]);
 			/* cycles: 2 + wait states */
@@ -911,16 +1100,23 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip)
 			dpi(AL, OP_ADD, 0, R10, R0, 2);
 		}
 		dpr(AL, OP_ADD, 0, R5, R5, R10, 0, 0);
+		if (jit_dbg) {
+			mov32(R0, i);
+			dpr(AL, OP_MOV, 0, R1, 0, R10, 0, 0);
+			dpr(AL, OP_MOV, 0, R2, 0, R5, 0, 0);
+			call((const void *)jit_dbg_rec);
+		}
 		/* a peripheral or this block's code was touched, or an AGU delay is
 		   pending: end after this instruction */
 		dpi(AL, OP_TST, 1, 0, R9, JF_EXIT);
 		exits[i] = bcc(NE);
+		jit_prev_agu = ik[i] == 1 ? jit_cur_agu : 0;
 	}
 	/* the block is a DO loop's body, from its start (SSH) to LA: loop here
 	   while LC > 1, as dsp_postexecute_update_pc would, up to a budget (LF
 	   and LA were checked on entry; nothing in a block changes them, SSH or
 	   LC) */
-	if (clip != 0xffff && clip == ia[n - 1] + il[n - 1] - 1) {
+	if (clip != 0xffff && clip == ia[n - 1] + il[n - 1] - 1 && ik[n - 1] != 3 && !jit_prev_agu) {
 		ldr(R0, R4, OFF_REG(DSP_REG_LC));
 		cmpi(R0, 1);
 		to_end[nend++] = bcc(EQ);
@@ -944,8 +1140,14 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip)
 		for (i = 0; i < nend; i++) patch(to_end[i], ep);
 		ldr(R0, SP, S_CNT);
 		opi(OP_ADD, R0, R0, n);
-		mov32(R1, ia[n - 1]);
-		mov32(R2, il[n - 1]);
+		if (ik[n - 1] == 3) {
+			mov32(IP, (uint32_t)(uintptr_t)&jit_out);
+			ldr(R1, IP, 4);
+			ldr(R2, IP, 8);
+		} else {
+			mov32(R1, ia[n - 1]);
+			mov32(R2, il[n - 1]);
+		}
 		to_epi[n] = bcc(AL);
 		for (i = 0; i < n; i++) {
 			patch(exits[i], ep);
@@ -980,7 +1182,7 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip)
 
 static int jit_valid(const jit_block_t *b)
 {
-	return *b->pv[0] == b->ver[0] && *b->pv[1] == b->ver[1];
+	return *b->pv[0] == b->ver[0] && *b->pv[1] == b->ver[1] && *b->pv[2] == b->ver[2];
 }
 
 /* drop every block (memory changed behind the core's back: tests) */
@@ -1054,7 +1256,9 @@ int dsp56k_jit_step(uint32_t *cycles)
 	}
 	if (!b->n) goto interp;
 
+	if (jit_dbg) dsp_jit_dbg[2 * JIT_MAX + 3] = b->start;
 	b->code();
+	if (jit_dbg) { dsp_jit_dbg[2 * JIT_MAX] = jit_out.cycles; dsp_jit_dbg[2 * JIT_MAX + 1] = jit_out.n; dsp_jit_dbg[2 * JIT_MAX + 2] = jit_out.pc | jit_out.len << 16; }
 	dsp_core.pc = jit_out.pc;
 	cur_inst_len = jit_out.len;
 	jit_post();
@@ -1073,6 +1277,7 @@ interp:
 #else
 
 uint32_t dsp_jit_stats[8];
+uint32_t dsp_jit_dbg[68];
 
 void dsp56k_jit_flush(void) {}
 
