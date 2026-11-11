@@ -21,7 +21,7 @@
 CORE(ref_)
 CORE(new_)
 extern uint32_t new_dsp_jit_dbg[68];	/* NEXT_DSP_JIT_DBG=1: the new side's cycles per instruction of the last block */
-extern uint32_t new_dsp_jit_why[12];	/* why steps went to the interpreter; [11] blocks kept after a code page write */
+extern uint32_t new_dsp_jit_why[16];	/* why steps went to the interpreter; [11] blocks kept after a code page write */
 
 static void hi(int x) { (void)x; }
 static uint64_t s;

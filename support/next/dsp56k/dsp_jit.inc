@@ -102,6 +102,8 @@ typedef struct jit_block_s {
 	const uint32_t *pv[JIT_PV];	/* code version counters of its pages */
 	uint32_t ver[JIT_PV];
 	void (*code)(void);
+	void *body;			/* after the prologue: where a chained block jumps in */
+	uint8_t rc;			/* keeps A/B in ARM registers (jit_rc) */
 	const uint32_t *src[2 * JIT_MAX];	/* where each P word came from */
 	uint32_t word[2 * JIT_MAX];
 } jit_block_t;
@@ -689,7 +691,7 @@ static int jit_dbg;			/* NEXT_DSP_JIT_DBG=1: record each instruction's cycles (t
 uint32_t dsp_jit_dbg[2 * JIT_MAX + 4];
 uint32_t *dsp_jit_ihist;			/* tests: interpreted instructions per PC (set by the caller) */
 uint32_t *dsp_jit_khist;			/* tests: Hatari handlers run inside blocks (jit_interp) per PC */
-uint32_t dsp_jit_why[12];			/* interpreted steps by reason: boot ROM, REP, OMR wait, fast
+uint32_t dsp_jit_why[16];			/* interpreted steps by reason: boot ROM, REP, OMR wait, fast
 						   interrupt, AGU delay, trace, interrupt pending, no block,
 						   AGU mismatch, off */	/* [i]: cycles of the block's instruction i, [JIT_MAX + i] the block's cycles so far */
 static void jit_dbg_rec(uint32_t i, uint32_t cycles, uint32_t bits)
@@ -1626,6 +1628,8 @@ static void gen_cc(uint32_t cc)
 	dpi(AL, OP_CMP, 1, 0, R0, 0);
 }
 
+static void *jit_next(uint32_t pc, uint32_t rc);
+
 static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 {
 	jit_block_t *b;
@@ -2011,7 +2015,34 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 			mov32(R2, jit_xr[i].len);
 			to_epi[i] = bcc(AL);
 		}
+		/* chain: on to the next block without returning (jit_next does the
+		   end of instruction and checks it), unless an exit flag is set,
+		   the budget is spent, or jit_next says no */
 		epi = ep;
+		if (!jit_dbg) {
+			uint32_t *no1, *no2, *no3;
+			dpi(AL, OP_TST, 1, 0, R5, FB(JF_EXIT));
+			no1 = bcc(NE);
+			cmpi(R0, JIT_LOOP_BUDGET);
+			no2 = bcc(HS);
+			str(R0, SP, S_CNT);
+			str(R1, SP, S_ADDR1);
+			str(R2, SP, S_ADDR2);
+			dpr(AL, OP_ADD, 0, R0, R1, R2, 0, 0);
+			ubfx(R0, R0, 0, 16);
+			dpi(AL, OP_MOV, 0, R1, 0, jit_rc);
+			call((const void *)jit_next);
+			dpi(AL, OP_CMP, 1, 0, R0, 0);
+			no3 = bcc(EQ);
+			dpi(AL, OP_BIC, 0, R5, R5, FB_MASK);
+			emit(0xE12FFF10 | R0);		/* bx r0 */
+			patch(no3, ep);
+			ldr(R0, SP, S_CNT);
+			ldr(R1, SP, S_ADDR1);
+			ldr(R2, SP, S_ADDR2);
+			patch(no1, ep);
+			patch(no2, ep);
+		}
 		for (i = 0; i <= jit_nxr; i++) patch(to_epi[i], epi);
 		if (jit_rc) rc_writeback();
 		dpi(AL, OP_BIC, 0, R5, R5, FB_MASK);
@@ -2034,6 +2065,8 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 	b->mmask = jit_mmask;
 	for (i = 0; i < 8; i++) b->m[i] = jit_m[i];
 	b->code = (void (*)(void))start;
+	b->body = body;
+	b->rc = jit_rc;
 	jit_ptr = (uint8_t *)ep;
 	return b;
 }
@@ -2058,6 +2091,32 @@ static int jit_valid(jit_block_t *b)
 	for (i = 0; i < b->npv; i++) b->ver[i] = *b->pv[i];
 	dsp_jit_why[11]++;
 	return 1;
+}
+
+/* the next block for a chained exit at pc (jit_post's plain case, then
+   dsp56k_jit_step's checks): its body, or NULL to return instead */
+static void *jit_next(uint32_t pc, uint32_t rc)
+{
+	jit_block_t *b;
+	uint32_t sr = dsp_core.registers[DSP_REG_SR];
+	if (dsp_core.agu_pipeline_reg[1] || dsp_core.loop_rep || dsp_core.mode_wait || dsp_core.mode == 1 ||
+	    (sr & ((1 << DSP_SR_LF) | (1 << DSP_SR_T))) || dsp_core.interrupt_state == DSP_INTERRUPT_DISABLED ||
+	    (dsp_core.interrupt_status & DSP_INTER_NMI_MASK) ||
+	    (dsp_core.interrupt_status & dsp_core.interrupt_enable & dsp_core.interrupt_mask)) {
+		dsp_jit_why[(sr >> DSP_SR_LF) & 1 ? 13 : 14]++;
+		return NULL;
+	}
+	b = jit_tab[JIT_IDX(pc)];
+	if (!b || b->start != pc || !b->n || !b->code || b->eagu || b->clip != 0xffff || b->rc != rc ||
+	    b->scal != ((sr >> DSP_SR_S0) & 3) || !jit_valid(b) || (b->mmask && !jit_m_ok(b))) {
+		dsp_jit_why[15]++;
+		return NULL;
+	}
+	dsp_jit_why[12]++;
+	dsp_core.agu_pipeline_reg[0] = 0;
+	dsp_core.pc = pc;
+	dsp_jit_stats[0]++;
+	return b->body;
 }
 
 /* drop every block (memory changed behind the core's back: tests) */
@@ -2231,7 +2290,7 @@ interp:
 uint32_t dsp_jit_stats[8];
 uint32_t dsp_jit_dbg[68];
 uint32_t *dsp_jit_ihist, *dsp_jit_khist;
-uint32_t dsp_jit_why[12];
+uint32_t dsp_jit_why[16];
 
 void dsp56k_jit_flush(void) {}
 

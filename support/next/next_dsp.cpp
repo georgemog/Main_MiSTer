@@ -972,7 +972,7 @@ static void stats_poll(void)
 {
 	static int n, on;
 	static uint64_t w0, cpu0, i0, c0, s0, b0;
-	static uint32_t j0[8], y0[12];
+	static uint32_t j0[8], y0[16];
 	struct timespec ts;
 	if (++n < 20) return;		// (called every ~100 ms)
 	n = 0;
@@ -992,11 +992,12 @@ static void stats_poll(void)
 		     dsp_core.running ? "" : "  (DSP in reset)");
 		/* why steps were interpreted, recompile reasons, and the most
 		   interpreted PCs since the last line */
-		fprintf(f, "      interp why: boot %u rep %u omrwait %u fastint %u agu %u trace %u intpend %u noblock %u agumis %u  recompile: start %u changed %u lainside %u clip %u  kept %u  irq fast %u\n",
+		fprintf(f, "      interp why: boot %u rep %u omrwait %u fastint %u agu %u trace %u intpend %u noblock %u agumis %u  recompile: start %u changed %u lainside %u clip %u  kept %u  irq fast %u\n      chain: %u, no: do %u state %u block %u\n",
 		        dsp_jit_why[0] - y0[0], dsp_jit_why[1] - y0[1], dsp_jit_why[2] - y0[2], dsp_jit_why[3] - y0[3],
 		        dsp_jit_why[4] - y0[4], dsp_jit_why[5] - y0[5], dsp_jit_why[6] - y0[6], dsp_jit_why[7] - y0[7],
 		        dsp_jit_why[8] - y0[8], dsp_jit_stats[4] - j0[4], dsp_jit_stats[5] - j0[5], dsp_jit_stats[6] - j0[6],
-		        dsp_jit_stats[7] - j0[7], dsp_jit_why[11] - y0[11], dsp_jit_why[10] - y0[10]);
+		        dsp_jit_stats[7] - j0[7], dsp_jit_why[11] - y0[11], dsp_jit_why[10] - y0[10],
+		        dsp_jit_why[12] - y0[12], dsp_jit_why[13] - y0[13], dsp_jit_why[14] - y0[14], dsp_jit_why[15] - y0[15]);
 		if (dsp_jit_ihist) {
 			fprintf(f, "      top interp:");
 			for (int t = 0; t < 6; t++) {
