@@ -1757,6 +1757,16 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 		return b;
 	}
 
+	/* its P words, to tell a write to code from one to data sharing a
+	   code page (jit_valid) */
+	for (i = 0; i < n; i++)
+		for (int w = 0; w < il[i] && b->nw < 2 * JIT_MAX; w++) {
+			const uint32_t *s = jit_psrc(ia[i] + w);
+			if (!s) continue;
+			b->src[b->nw] = s;
+			b->word[b->nw++] = *s & BITMASK(24);
+		}
+
 	/* external RAM index ranges of the block's code */
 	ext_code = jit_nr > 0;
 	for (i = 0; i < jit_nr; i++) {
@@ -2032,10 +2042,18 @@ static int jit_m_ok(const jit_block_t *b)
 	return 1;
 }
 
-static int jit_valid(const jit_block_t *b)
+static int jit_valid(jit_block_t *b)
 {
-	for (int i = 0; i < b->npv; i++)
-		if (*b->pv[i] != b->ver[i]) return 0;
+	int i;
+	for (i = 0; i < b->npv; i++)
+		if (*b->pv[i] != b->ver[i]) break;
+	if (i == b->npv) return 1;
+	/* a code page was written: still valid if its own words are the same
+	   (Music Kit data shares pages with code) */
+	for (i = 0; i < b->nw; i++)
+		if ((*b->src[i] & BITMASK(24)) != b->word[i]) return 0;
+	for (i = 0; i < b->npv; i++) b->ver[i] = *b->pv[i];
+	dsp_jit_why[11]++;
 	return 1;
 }
 
@@ -2090,7 +2108,9 @@ int dsp56k_jit_step(uint32_t *cycles)
 	if (jit_off) { dsp_jit_why[9]++; goto interp; }
 	if (dsp_core.loop_rep) { dsp_jit_why[1]++; goto interp; }
 	if (dsp_core.mode_wait) { dsp_jit_why[2]++; goto interp; }
-	if (dsp_core.interrupt_state == DSP_INTERRUPT_DISABLED) { dsp_jit_why[3]++; goto interp; }	/* fast interrupt */
+	/* (a fast interrupt's pipeline: one-instruction blocks for it cost
+	   more than these interpreter steps, measured live) */
+	if (dsp_core.interrupt_state == DSP_INTERRUPT_DISABLED) { dsp_jit_why[3]++; goto interp; }
 	if (eagu && (eagu < DSP_REG_R0 || eagu > DSP_REG_M7 || dsp_core.agu_pipeline_reg[1])) { dsp_jit_why[4]++; goto interp; }
 	if (dsp_core.registers[DSP_REG_SR] & (1<<DSP_SR_T)) { dsp_jit_why[5]++; goto interp; }
 	/* an interrupt pending (raised by the host link since the last check):

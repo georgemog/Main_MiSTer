@@ -21,6 +21,7 @@
 CORE(ref_)
 CORE(new_)
 extern uint32_t new_dsp_jit_dbg[68];	/* NEXT_DSP_JIT_DBG=1: the new side's cycles per instruction of the last block */
+extern uint32_t new_dsp_jit_why[12];	/* why steps went to the interpreter; [11] blocks kept after a code page write */
 
 static void hi(int x) { (void)x; }
 static uint64_t s;
@@ -146,6 +147,7 @@ static int fuzz(long rounds)
 		if (fails) return 1;
 		if ((r + 1) % (rounds / 10 ? rounds / 10 : 1) == 0) printf("round %ld: %ld instructions, no mismatch\n", r + 1, steps);
 	}
+	if (getenv("LOCKSTEP_JIT")) printf("jit: %u blocks kept after a code page write\n", new_dsp_jit_why[11]);
 	return 0;
 }
 
@@ -189,6 +191,7 @@ static int replay(const char *path, long n, int pc)
 	for (long i = 0; i < n; i++) if (step()) return 1;
 	cmp_mem();
 	if (use_jit) printf("jit: %ld blocks of more than 1, %ld instructions in them\n", blocks, in_blocks);
+	if (use_jit) printf("jit: %u blocks kept after a code page write\n", new_dsp_jit_why[11]);
 	printf("replay %s from %04x: %ld instructions, %s (pc %04x)\n", path, pc >= 0 ? pc : h.pc, steps, fails ? "MISMATCH" : "no mismatch", ref_dsp_core.pc);
 	return fails > 0;
 }
