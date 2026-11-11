@@ -199,6 +199,7 @@ static int replay(const char *path, long n, int pc)
 int main(int argc, char **argv)
 {
 	use_jit = getenv("LOCKSTEP_JIT") != NULL;
+	setenv("NEXT_DSP_JIT_IRQ", "0", 0);	/* (Hatari's interrupt pipeline, as the reference; =1 to try the JIT's) */
 	if (argc > 3 && !strcmp(argv[1], "fuzz")) { s = strtoull(argv[2], 0, 0) | 1; return fuzz(atol(argv[3])); }
 	if (argc > 3 && !strcmp(argv[1], "replay")) return replay(argv[2], atol(argv[3]), argc > 4 ? (int)strtol(argv[4], 0, 16) : -1);
 	printf("usage: lockstep fuzz SEED ROUNDS | replay DUMP N [pc]\n");

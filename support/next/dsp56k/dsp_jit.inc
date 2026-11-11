@@ -134,6 +134,7 @@ static uint32_t *jit_ramext;
 static uint32_t jit_ramsize;
 static int jit_off;			/* NEXT_DSP_JIT=0 in the environment */
 static int jit_saw_boot;
+static int jit_irq_exact;		/* NEXT_DSP_JIT_IRQ=0: interrupts through Hatari's pipeline, at any instruction */
 static int jit_max = JIT_MAX;		/* NEXT_DSP_JIT_MAX=n: shorter blocks (debugging) */
 static const uint8_t jit_wait[8] = { 0, 0, 0, 2, 0, 2, 2, 4 };	/* X=1 Y=2 P=4 */
 uint32_t dsp_jit_stats[8];		/* blocks run, instructions in blocks, interpreted, compiles;
@@ -1483,6 +1484,8 @@ static int jit_init(void)
 	if (e && atoi(e) > 0 && atoi(e) < JIT_MAX) jit_max = atoi(e);
 	e = getenv("NEXT_DSP_JIT_DBG");
 	if (e && *e >= '1' && *e <= '2') jit_dbg = *e - '0';	/* 2: also exit after every deferred-flags op */
+	e = getenv("NEXT_DSP_JIT_IRQ");
+	if (e && *e == '0') jit_irq_exact = 1;
 	e = getenv("NEXT_DSP_JIT_RC");
 	if (e && *e == '0') jit_rc_off = 1;
 	e = getenv("NEXT_DSP_JIT_ALU");
@@ -2080,8 +2083,58 @@ static void jit_post(void)
 		dsp_postexecute_update_pc();
 	if (!(dsp_core.loop_rep == 0 && dsp_core.interrupt_state != DSP_INTERRUPT_DISABLED &&
 	      !(dsp_core.interrupt_status & DSP_INTER_NMI_MASK) &&
-	      !(dsp_core.interrupt_status & dsp_core.interrupt_enable & dsp_core.interrupt_mask)))
-		dsp_postexecute_interrupts();
+	      !(dsp_core.interrupt_status & dsp_core.interrupt_enable & dsp_core.interrupt_mask)) &&
+	    (jit_irq_exact || dsp_core.interrupt_state == DSP_INTERRUPT_DISABLED))
+		dsp_postexecute_interrupts();	/* (else the next step takes it: jit_take_irq) */
+}
+
+/* a JSR or JMP: makes an interrupt long (dsp_postexecute_interrupts) */
+static int jit_irq_long(uint32_t instr)
+{
+	return ((instr & 0xfff000) == 0x0d0000) || ((instr & 0xffc0ff) == 0x0bc080) ||
+	       ((instr & 0xfff000) == 0x0c0000) || ((instr & 0xffc0ff) == 0x0ac080);
+}
+
+/* a pending interrupt, taken between blocks: Hatari accepts it; a fast
+   one's vector instructions then run at once and the PC goes back, instead
+   of Hatari's pipeline interleaving them two instructions in (it can come
+   up to a block later than on the real chip).  A long interrupt (or one
+   masked by the IPL) is left to Hatari.  Returns the instructions run. */
+static int jit_fast_vector(uint32_t *cycles);
+
+static int jit_take_irq(uint32_t *cycles)
+{
+	dsp_postexecute_interrupts();
+	return jit_fast_vector(cycles);
+}
+
+/* an interrupt Hatari has just accepted (pipeline count 5): a fast one's
+   vector instructions now, then back; 0 (Hatari's pipeline) for anything
+   else */
+static int jit_fast_vector(uint32_t *cycles)
+{
+	uint32_t vec, save_pc;
+	const uint32_t *s0, *s1;
+	int n = 0;
+	if (dsp_core.interrupt_state != DSP_INTERRUPT_DISABLED || dsp_core.interrupt_pipeline_count != 5) return 0;
+	vec = dsp_core.interrupt_instr_fetch;
+	s0 = jit_psrc(vec); s1 = jit_psrc(vec + 1);
+	if (!s0 || !s1 || jit_irq_long(*s0 & BITMASK(24)) || jit_irq_long(*s1 & BITMASK(24))) return 0;
+	save_pc = dsp_core.pc;
+	dsp_core.pc = vec;
+	do {
+		dsp_core.interrupt_pipeline_count = 1;	/* (its end of instruction: 1 -> 0, nothing else) */
+		dsp56k_execute_instruction();
+		*cycles += dsp_core.instr_cycle;
+		n++;
+	} while (n < 2 && dsp_core.pc == vec + 1);
+	if (dsp_core.pc == vec + 2) dsp_core.pc = save_pc;
+	dsp_core.interrupt_save_pc = -1;
+	dsp_core.interrupt_instr_fetch = -1;
+	dsp_core.interrupt_pipeline_count = 0;
+	dsp_core.interrupt_state = DSP_INTERRUPT_NONE;
+	dsp_jit_why[10]++;
+	return n;
 }
 
 /* one block, or one interpreted instruction; returns the instructions run
@@ -2105,9 +2158,18 @@ int dsp56k_jit_step(uint32_t *cycles)
 	}
 	eagu = dsp_core.agu_pipeline_reg[0];
 	/* (dsp_jit_why: why a step goes to the interpreter, for the stats) */
+	if (!jit_mem && !jit_off && jit_init()) { dsp_jit_why[9]++; goto interp; }	/* (reads the switches) */
 	if (jit_off) { dsp_jit_why[9]++; goto interp; }
 	if (dsp_core.loop_rep) { dsp_jit_why[1]++; goto interp; }
 	if (dsp_core.mode_wait) { dsp_jit_why[2]++; goto interp; }
+	/* an interrupt pending: taken here, between blocks */
+	if (!jit_irq_exact && dsp_core.interrupt_state != DSP_INTERRUPT_DISABLED &&
+	    !(dsp_core.registers[DSP_REG_SR] & (1<<DSP_SR_T)) &&
+	    ((dsp_core.interrupt_status & DSP_INTER_NMI_MASK) ||
+	     (dsp_core.interrupt_status & dsp_core.interrupt_enable & dsp_core.interrupt_mask))) {
+		int k = jit_take_irq(cycles);
+		if (k) return k;
+	}
 	/* (a fast interrupt's pipeline: one-instruction blocks for it cost
 	   more than these interpreter steps, measured live) */
 	if (dsp_core.interrupt_state == DSP_INTERRUPT_DISABLED) { dsp_jit_why[3]++; goto interp; }
@@ -2115,9 +2177,8 @@ int dsp56k_jit_step(uint32_t *cycles)
 	if (dsp_core.registers[DSP_REG_SR] & (1<<DSP_SR_T)) { dsp_jit_why[5]++; goto interp; }
 	/* an interrupt pending (raised by the host link since the last check):
 	   the interpreter takes it after one instruction */
-	if ((dsp_core.interrupt_status & DSP_INTER_NMI_MASK) ||
-	    (dsp_core.interrupt_status & dsp_core.interrupt_enable & dsp_core.interrupt_mask)) { dsp_jit_why[6]++; goto interp; }
-	if (!jit_mem && jit_init()) goto interp;
+	if (jit_irq_exact && ((dsp_core.interrupt_status & DSP_INTER_NMI_MASK) ||
+	    (dsp_core.interrupt_status & dsp_core.interrupt_enable & dsp_core.interrupt_mask))) { dsp_jit_why[6]++; goto interp; }
 	if (dsp_core.ramext != jit_ramext || DSP_RAMSIZE != jit_ramsize) jit_flush();
 
 	lf = (dsp_core.registers[DSP_REG_SR] >> DSP_SR_LF) & 1;
@@ -2152,9 +2213,16 @@ int dsp56k_jit_step(uint32_t *cycles)
 
 interp:
 	if (dsp_jit_ihist) dsp_jit_ihist[dsp_core.pc]++;
-	dsp56k_execute_instruction();
-	*cycles += dsp_core.instr_cycle;
-	dsp_jit_stats[2]++;
+	{
+		int was = dsp_core.interrupt_state == DSP_INTERRUPT_DISABLED;
+		dsp56k_execute_instruction();
+		*cycles += dsp_core.instr_cycle;
+		dsp_jit_stats[2]++;
+		/* (it accepted an interrupt, or a pipeline ended and accepted the
+		   next: take a fast one's vector now, not two instructions on) */
+		if (!jit_irq_exact && (!was || dsp_core.interrupt_pipeline_count == 5) && dsp_core.mode != 1)
+			return 1 + jit_fast_vector(cycles);
+	}
 	return 1;
 }
 

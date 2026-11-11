@@ -48,6 +48,9 @@
   `NEXT_DSP_JIT_DBG=1` records each block instruction's cycles and the running
   total, which lockstep prints beside the reference's on a cycle mismatch;
   `NEXT_DSP_JIT_RC=0` keeps A/B in dsp_core instead of ARM registers;
+  `NEXT_DSP_JIT_IRQ=0` takes interrupts through Hatari's pipeline at any
+  instruction (lockstep sets it, as the reference does; by default the JIT
+  takes them between blocks and runs a fast interrupt's vector at once);
   `NEXT_DSP_JIT_DBG=2` also ends the block after every ALU op whose flags
   were deferred, so lockstep checks the rebuilt SR each time.
   The fuzz seed is ORed with 1, so use odd seeds (2 and 3 are the same run);
