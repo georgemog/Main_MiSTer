@@ -48,6 +48,7 @@
 //     a host message.
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -152,6 +153,8 @@ static int      arm_dirty;               // the ARM word needs writing
 static uint8_t  epoch;                   // of the last H2D message handled
 static uint32_t msgs;                    // H2D messages handled (debug)
 static uint64_t instrs;                  // DSP instructions run (debug)
+// always-on load counters, logged while NEXT_DSP_DIR/stats exists (stats_poll)
+static uint64_t st_cycles, st_sleep_ns, st_behind;
 
 // D2H messages not yet in the ring (the ring was full)
 #define PENDQ_N 64
@@ -834,13 +837,14 @@ static int link_step(int n)
 	while (done < n && dsp_core.running && pend_n < PENDQ_N / 2)
 	{
 		int k = 1;
-		if (prof_on) { prof_execute(); step_cycles += dsp_core.instr_cycle; }
+		if (prof_on) { prof_execute(); step_cycles += dsp_core.instr_cycle; st_cycles += dsp_core.instr_cycle; }
 		else
 		{
 			// one compiled block (dsp_jit.inc), or one instruction
 			uint32_t c = 0;
 			k = dsp56k_jit_step(&c);
 			step_cycles += c;
+			st_cycles += c;
 		}
 		done += k;
 		instrs += k;
@@ -961,6 +965,60 @@ static void trace_poll(void)
 	nlog("trace %s: %s\n", path, trace_dump(path) ? "write failed" : "written");
 }
 
+// every 2 s while NEXT_DSP_DIR/stats exists: how much of the time the DSP
+// thread sleeps ahead of the real DSP's pace (its headroom), its CPU use,
+// the instruction and cycle rates, fall-behind events, JIT activity
+static void stats_poll(void)
+{
+	static int n, on;
+	static uint64_t w0, cpu0, i0, c0, s0, b0;
+	static uint32_t j0[8], y0[12];
+	struct timespec ts;
+	if (++n < 20) return;		// (called every ~100 ms)
+	n = 0;
+	int armed = access(NEXT_DSP_DIR "/stats", F_OK) == 0;
+	clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+	uint64_t cpu = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec, w = now_ns();
+	if (armed && on && w > w0)
+	{
+		double dw = (double)(w - w0);
+		FILE *f = fopen(NEXT_DSP_DIR "/stats.log", "a");	// (Main's stdout is /dev/null unless debug is on)
+		if (!f) goto out;
+		fprintf(f, "%llu stats: asleep %4.1f%%  cpu %4.1f%%  %5.2f MIPS  %5.2f Mcycles/s  behind %llu  jit blocks %u interp %u compiles %u%s\n",
+		     (unsigned long long)(w / 1000000000ull), 100.0 * (st_sleep_ns - s0) / dw, 100.0 * (cpu - cpu0) / dw,
+		     (instrs - i0) * 1e3 / dw, (st_cycles - c0) * 1e3 / dw,
+		     (unsigned long long)(st_behind - b0),
+		     dsp_jit_stats[0] - j0[0], dsp_jit_stats[2] - j0[2], dsp_jit_stats[3] - j0[3],
+		     dsp_core.running ? "" : "  (DSP in reset)");
+		/* why steps were interpreted, recompile reasons, and the most
+		   interpreted PCs since the last line */
+		fprintf(f, "      interp why: boot %u rep %u omrwait %u fastint %u agu %u trace %u intpend %u noblock %u agumis %u  recompile: start %u changed %u lainside %u clip %u\n",
+		        dsp_jit_why[0] - y0[0], dsp_jit_why[1] - y0[1], dsp_jit_why[2] - y0[2], dsp_jit_why[3] - y0[3],
+		        dsp_jit_why[4] - y0[4], dsp_jit_why[5] - y0[5], dsp_jit_why[6] - y0[6], dsp_jit_why[7] - y0[7],
+		        dsp_jit_why[8] - y0[8], dsp_jit_stats[4] - j0[4], dsp_jit_stats[5] - j0[5], dsp_jit_stats[6] - j0[6],
+		        dsp_jit_stats[7] - j0[7]);
+		if (dsp_jit_ihist) {
+			fprintf(f, "      top interp:");
+			for (int t = 0; t < 6; t++) {
+				uint32_t best = 0, bp = 0;
+				for (uint32_t p = 0; p < 65536; p++) if (dsp_jit_ihist[p] > best) { best = dsp_jit_ihist[p]; bp = p; }
+				if (!best) break;
+				fprintf(f, " %04x:%u", bp, best);
+				dsp_jit_ihist[bp] = 0;
+			}
+			fprintf(f, "\n");
+			memset(dsp_jit_ihist, 0, 65536 * 4);
+		}
+		fclose(f);
+	}
+	if (armed && !dsp_jit_ihist) dsp_jit_ihist = (uint32_t *)calloc(65536, 4);
+out:
+	on = armed;
+	w0 = w; cpu0 = cpu; i0 = instrs; c0 = st_cycles; s0 = st_sleep_ns; b0 = st_behind;
+	memcpy(j0, dsp_jit_stats, sizeof(j0));
+	memcpy(y0, dsp_jit_why, sizeof(y0));
+}
+
 static void *dsp_thread(void *)
 {
 	uint64_t t0 = now_ns(), last_dbg = 0;
@@ -975,7 +1033,7 @@ static void *dsp_thread(void *)
 		{
 			last_dbg = t;
 			debug_word();
-			if (++prof_poll_n >= 10) { prof_poll_n = 0; prof_poll(); trace_poll(); knob_poll(); }   // every ~100 ms
+			if (++prof_poll_n >= 10) { prof_poll_n = 0; prof_poll(); trace_poll(); knob_poll(); stats_poll(); }   // every ~100 ms
 		}
 
 		if (!linked)
@@ -999,12 +1057,14 @@ static void *dsp_thread(void *)
 			struct timespec ts = { 0, (long)(due - t) };
 			nanosleep(&ts, NULL);
 			if (prof_on) prof_sleep += due - t;
+			st_sleep_ns += due - t;
 		}
 		else if (t > due + 50000000ull)
 		{
 			// far behind (the interpreter is slower than the DSP): don't bank it
 			t0 = t; step_cycles = 0;
 			if (prof_on) prof_behind++;
+			st_behind++;
 		}
 	}
 	return NULL;

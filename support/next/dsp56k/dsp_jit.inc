@@ -687,7 +687,10 @@ static int jit_scal;			/* SR scaling bits of the block being compiled */
 static int jit_dbg;			/* NEXT_DSP_JIT_DBG=1: record each instruction's cycles (tests) */
 uint32_t dsp_jit_dbg[2 * JIT_MAX + 4];
 uint32_t *dsp_jit_ihist;			/* tests: interpreted instructions per PC (set by the caller) */
-uint32_t *dsp_jit_khist;			/* tests: Hatari handlers run inside blocks (jit_interp) per PC */	/* [i]: cycles of the block's instruction i, [JIT_MAX + i] the block's cycles so far */
+uint32_t *dsp_jit_khist;			/* tests: Hatari handlers run inside blocks (jit_interp) per PC */
+uint32_t dsp_jit_why[12];			/* interpreted steps by reason: boot ROM, REP, OMR wait, fast
+						   interrupt, AGU delay, trace, interrupt pending, no block,
+						   AGU mismatch, off */	/* [i]: cycles of the block's instruction i, [JIT_MAX + i] the block's cycles so far */
 static void jit_dbg_rec(uint32_t i, uint32_t cycles, uint32_t bits)
 {
 	if (i < JIT_MAX) { dsp_jit_dbg[i] = cycles; dsp_jit_dbg[JIT_MAX + i] = bits; }
@@ -1962,6 +1965,7 @@ int dsp56k_jit_step(uint32_t *cycles)
 	if (dsp_core.mode == 1) {
 		/* the bootstrap ROM loads internal P directly (dsp_core.c) */
 		jit_saw_boot = 1;
+		dsp_jit_why[0]++;
 		goto interp;
 	}
 	if (jit_saw_boot) {
@@ -1969,15 +1973,17 @@ int dsp56k_jit_step(uint32_t *cycles)
 		jit_saw_boot = 0;
 	}
 	eagu = dsp_core.agu_pipeline_reg[0];
-	if (jit_off || dsp_core.loop_rep || dsp_core.mode_wait ||
-	    dsp_core.interrupt_state == DSP_INTERRUPT_DISABLED ||
-	    (eagu && (eagu < DSP_REG_R0 || eagu > DSP_REG_M7 || dsp_core.agu_pipeline_reg[1])) ||
-	    (dsp_core.registers[DSP_REG_SR] & (1<<DSP_SR_T)) ||
-	    /* an interrupt pending (raised by the host link since the last
-	       check): the interpreter takes it after one instruction */
-	    (dsp_core.interrupt_status & DSP_INTER_NMI_MASK) ||
-	    (dsp_core.interrupt_status & dsp_core.interrupt_enable & dsp_core.interrupt_mask))
-		goto interp;
+	/* (dsp_jit_why: why a step goes to the interpreter, for the stats) */
+	if (jit_off) { dsp_jit_why[9]++; goto interp; }
+	if (dsp_core.loop_rep) { dsp_jit_why[1]++; goto interp; }
+	if (dsp_core.mode_wait) { dsp_jit_why[2]++; goto interp; }
+	if (dsp_core.interrupt_state == DSP_INTERRUPT_DISABLED) { dsp_jit_why[3]++; goto interp; }	/* fast interrupt */
+	if (eagu && (eagu < DSP_REG_R0 || eagu > DSP_REG_M7 || dsp_core.agu_pipeline_reg[1])) { dsp_jit_why[4]++; goto interp; }
+	if (dsp_core.registers[DSP_REG_SR] & (1<<DSP_SR_T)) { dsp_jit_why[5]++; goto interp; }
+	/* an interrupt pending (raised by the host link since the last check):
+	   the interpreter takes it after one instruction */
+	if ((dsp_core.interrupt_status & DSP_INTER_NMI_MASK) ||
+	    (dsp_core.interrupt_status & dsp_core.interrupt_enable & dsp_core.interrupt_mask)) { dsp_jit_why[6]++; goto interp; }
 	if (!jit_mem && jit_init()) goto interp;
 	if (dsp_core.ramext != jit_ramext || DSP_RAMSIZE != jit_ramsize) jit_flush();
 
@@ -1997,8 +2003,8 @@ int dsp56k_jit_step(uint32_t *cycles)
 		if (!b) goto interp;
 	}
 	/* (entered with another AGU delay than compiled for: step it) */
-	if (b->eagu != eagu) goto interp;
-	if (!b->n) goto interp;
+	if (b->eagu != eagu) { dsp_jit_why[8]++; goto interp; }
+	if (!b->n) { dsp_jit_why[7]++; goto interp; }
 
 	if (jit_dbg) dsp_jit_dbg[2 * JIT_MAX + 3] = b->start;
 	b->code();
@@ -2024,6 +2030,7 @@ interp:
 uint32_t dsp_jit_stats[8];
 uint32_t dsp_jit_dbg[68];
 uint32_t *dsp_jit_ihist, *dsp_jit_khist;
+uint32_t dsp_jit_why[12];
 
 void dsp56k_jit_flush(void) {}
 
