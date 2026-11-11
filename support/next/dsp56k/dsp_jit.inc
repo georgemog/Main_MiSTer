@@ -1043,11 +1043,109 @@ static int jit_dst_ok(uint32_t r)  { return r >= DSP_REG_X0 && r <= DSP_REG_N7; 
 static int jit_tcc_ok(uint32_t inst) { return (inst & 0xff0f87) == 0x020000 && registers_tcc[(inst >> 3) & 15][0] != DSP_REG_NULL; }
 static int jit_src_ok(uint32_t r)  { return (r >= DSP_REG_X0 && r <= DSP_REG_B) || (r >= DSP_REG_R0 && r <= DSP_REG_N7); }
 
+/* Hatari's handler of a word below $100000 */
+static dsp_emul_t jit_f8(uint32_t inst)
+{
+	return opcodes8h[((inst >> 11) & (BITMASK(6) << 3)) + ((inst >> 5) & BITMASK(3))];
+}
+
+/* a peripheral read without side effects (not HRX or the SSI receiver) */
+static int jit_pp_plain(uint32_t inst)
+{
+	uint32_t pp = (inst >> 8) & 0x3f;
+	return ((inst >> 6) & 1) || (pp != DSP_HOST_HRX && pp != DSP_SSI_RX);
+}
+
+/* BSET/BCLR/BCHG/BTST with an ea (not an immediate) */
+static int jit_bit_ea(uint32_t inst)
+{
+	dsp_emul_t f = jit_f8(inst);
+	uint32_t ea = (inst >> 8) & 0x3f;
+	return (f == dsp_bset_ea || f == dsp_bclr_ea || f == dsp_bchg_ea || f == dsp_btst_ea) &&
+	       !((ea >> 3) == 6 && (ea & 7));
+}
+
+/* bit ops compiled: BSET/BCLR/BCHG/BTST on aa (internal X/Y $0-$3f) or an
+   absolute address (jit_compile hands those outside internal X/Y $0-$ff to
+   Hatari), BTST on a plain peripheral (bits 0-23) */
+static int jit_bit_nat(uint32_t inst)
+{
+	dsp_emul_t f = jit_f8(inst);
+	if ((inst & 0x1f) >= 24) return 0;
+	if (f == dsp_bset_aa || f == dsp_bclr_aa || f == dsp_bchg_aa || f == dsp_btst_aa) return 1;
+	if (jit_bit_ea(inst) && ((inst >> 8) & 0x3f) == 0x30) return 1;
+	return f == dsp_btst_pp && jit_pp_plain(inst);
+}
+
+/* the other bit ops on aa/pp/ea: Hatari's handler inside a block (a
+   peripheral access ends it) */
+static int jit_bit_int(uint32_t inst)
+{
+	dsp_emul_t f = jit_f8(inst);
+	return f == dsp_bset_aa || f == dsp_bclr_aa || f == dsp_bchg_aa || f == dsp_btst_aa ||
+	       f == dsp_bset_pp || f == dsp_bclr_pp || f == dsp_bchg_pp || f == dsp_btst_pp || jit_bit_ea(inst);
+}
+
+/* the bit op's internal X/Y address (aa, or the absolute one in jit_w2) */
+static uint32_t jit_bit_addr(uint32_t inst)
+{
+	return jit_bit_ea(inst) ? (jit_w2 & 0xffff) : ((inst >> 8) & 0x3f);
+}
+
+/* JSET/JCLR on aa or a plain peripheral, bits 0-23 */
+static int jit_bitj(uint32_t inst)
+{
+	dsp_emul_t f = jit_f8(inst);
+	if ((inst & 0x1f) >= 24) return 0;
+	if (f == dsp_jset_aa || f == dsp_jclr_aa) return 1;
+	return (f == dsp_jset_pp || f == dsp_jclr_pp) && jit_pp_plain(inst);
+}
+
+/* R0 = the 24-bit word an aa/pp bit op addresses */
+static void gen_bit_load(uint32_t inst)
+{
+	uint32_t space = (inst >> 6) & 1, a = (inst >> 8) & 0x3f;
+	dsp_emul_t f = jit_f8(inst);
+	if (jit_bit_ea(inst)) a = jit_bit_addr(inst);
+	if (f == dsp_btst_pp || f == dsp_jset_pp || f == dsp_jclr_pp) {
+		mov32(IP, (uint32_t)(uintptr_t)&dsp_core.periph[space][a]);
+		ldr(R0, IP, 0);
+	} else {
+		ldr(R0, R9, (a + 512 * space) * 4);
+	}
+	dpi(AL, OP_BIC, 0, R0, R0, 0xff000000);
+}
+
+/* a compiled bit op: C = the bit, then set/clear/change it */
+static void gen_bitop(uint32_t inst)
+{
+	uint32_t space = (inst >> 6) & 1, a = jit_bit_addr(inst), bit = 1u << (inst & 0x1f);
+	dsp_emul_t f = jit_f8(inst);
+	gen_bit_load(inst);
+	ldr(R1, R4, OFF_REG(DSP_REG_SR));
+	dpi(AL, OP_TST, 1, 0, R0, bit);
+	dpi(AL, OP_BIC, 0, R1, R1, 1 << DSP_SR_C);
+	dpi(NE, OP_ORR, 0, R1, R1, 1 << DSP_SR_C);
+	str(R1, R4, OFF_REG(DSP_REG_SR));
+	if (f == dsp_btst_aa || f == dsp_btst_pp || f == dsp_btst_ea) return;
+	dpi(AL, (f == dsp_bset_aa || f == dsp_bset_ea) ? OP_ORR : (f == dsp_bclr_aa || f == dsp_bclr_ea) ? OP_BIC : OP_EOR, 0, R0, R0, bit);
+	str(R0, R9, (a + 512 * space) * 4);
+}
+
+/* flags for a compiled JSET/JCLR: NE when it jumps */
+static void gen_bitcc(uint32_t inst)
+{
+	dsp_emul_t f = jit_f8(inst);
+	gen_bit_load(inst);
+	if (f == dsp_jclr_aa || f == dsp_jclr_pp) dpr(AL, OP_MVN, 0, R0, 0, R0, 0, 0);
+	dpi(AL, OP_TST, 1, 0, R0, 1u << (inst & 0x1f));
+}
+
 /* can this word be compiled? (mirrors the gen_inst cases) */
 static int jit_native(uint32_t inst)
 {
 	if (inst == 0) return 1;				/* nop */
-	if (inst < 0x100000) return jit_tcc_ok(inst);
+	if (inst < 0x100000) return jit_tcc_ok(inst) || jit_bit_nat(inst);
 	if (opcodes_alu[inst & 0xff] == dsp_undefined) return 0;
 	switch ((inst >> 20) & 0xf) {
 	case 1:
@@ -1087,6 +1185,11 @@ static void gen_inst(uint32_t inst)
 	static const uint8_t yreg[4] = { DSP_REG_Y0, DSP_REG_Y1, DSP_REG_A, DSP_REG_B };
 
 	if (inst == 0) return;					/* nop */
+	if (inst < 0x100000 && !jit_tcc_ok(inst)) {		/* bit op */
+		gen_bitop(inst);
+		jit_xcyc += jit_bit_ea(inst) ? 4 : 2;	/* (+2 for the absolute address) */
+		return;
+	}
 	if (inst < 0x100000) {					/* Tcc S1,D1 */
 		uint32_t s1 = registers_tcc[(inst >> 3) & 15][0], d1 = registers_tcc[(inst >> 3) & 15][1] & 1;
 		uint32_t *skip;
@@ -1328,7 +1431,7 @@ static int jit_kind(uint32_t inst)
 	if (jit_native(inst)) return 1;
 	if (inst < 0x100000) {
 		uint32_t value = ((inst >> 11) & (BITMASK(6) << 3)) + ((inst >> 5) & BITMASK(3));
-		if (opcodes8h[value] == dsp_tcc) return 2;
+		if (opcodes8h[value] == dsp_tcc || jit_bit_int(inst)) return 2;
 		return opcodes8h[value] == dsp_undefined ? 0 : 3;
 	}
 	if (opcodes_alu[inst & 0xff] == dsp_undefined) return 0;
@@ -1340,7 +1443,7 @@ static int jit_kind(uint32_t inst)
 static int jit_len(uint32_t inst)
 {
 	uint32_t g = (inst >> 20) & 0xf, ea = (inst >> 8) & 0x3f;
-	if (inst < 0x100000) return 1;
+	if (inst < 0x100000) return (jit_bit_ea(inst) && (ea >> 3) == 6) ? 2 : 1;
 	if (g == 0 || g == 1) return (ea >> 3) == 6 ? 2 : 1;
 	if (g >= 4 && g <= 7) return ((inst & (1 << 14)) && (ea >> 3) == 6) ? 2 : 1;
 	return 1;
@@ -1395,7 +1498,7 @@ static int jit_init(void)
 }
 
 /* control instructions compiled into blocks (step 4) */
-enum { K_END = 0, K_NAT = 1, K_INT = 2, K_TAIL = 3, K_DO = 4, K_JMP = 5, K_JCC = 6, K_REP = 7 };
+enum { K_END = 0, K_NAT = 1, K_INT = 2, K_TAIL = 3, K_DO = 4, K_JMP = 5, K_JCC = 6, K_REP = 7, K_JB = 8 };
 
 /* a jump, Jcc or DO the compiler handles: kind, target (DO: LA), words,
    cycles; 0 for anything else */
@@ -1414,6 +1517,10 @@ static int jit_ctl(uint32_t inst, uint32_t a, uint32_t *tgt, int *len, int *cyc,
 		return f == dsp_jmp_imm ? K_JMP : K_JCC;
 	}
 	if (a >= 0xffff || !(s2 = jit_psrc(a + 1))) return 0;
+	if (jit_bitj(inst)) {			/* JSET/JCLR: a Jcc on a bit */
+		*tgt = *s2 & 0xffff; *len = 2; *cyc = 6;
+		return K_JB;
+	}
 	if ((f == dsp_jmp_ea || f == dsp_jcc_ea) && ((inst >> 8) & 0x3f) == 0x30) {	/* absolute */
 		*tgt = *s2 & 0xffff; *len = 2; *cyc = 6; *cc = inst & 15;
 		return f == dsp_jmp_ea ? K_JMP : K_JCC;
@@ -1527,7 +1634,7 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 	int8_t lend[JIT_MAX];
 	uint32_t iw[JIT_MAX], iw2[JIT_MAX];
 	uint32_t a = pc, cur_clip = clip, outer_clip = clip;
-	int n = 0, i, ext_code, loop_open = -1, jumps_ok = !lf, has_jump = 0, eagu_c = 0;
+	int n = 0, i, ext_code, loop_open = -1, jumps_ok = !lf || clip != 0xffff, has_jump = 0, eagu_c = 0;
 
 	if (jit_pool_n >= JIT_POOL || jit_ptr + 64 * 1024 > jit_mem + JIT_CODE_SIZE)
 		jit_flush();
@@ -1561,7 +1668,11 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 			if (c == K_DO && !(loop_open < 0 && tgt >= a + 2 && (cur_clip == 0xffff || tgt < cur_clip) &&
 			                   !(cur_clip >= a && cur_clip <= a + 1)))
 				c = 0;
-			if ((c == K_JMP || c == K_JCC) && !(jumps_ok && loop_open < 0 && cur_clip == 0xffff))
+			/* (in a DO loop, clipped at its LA: no jump at LA or to LA+1,
+			   where the interpreter would end a pass) */
+			if ((c == K_JMP || c == K_JCC || c == K_JB) &&
+			    !(jumps_ok && loop_open < 0 &&
+			      (lf ? cur_clip == clip && tgt != (uint32_t)clip + 1 && !(clip >= a && clip < a + len) : cur_clip == 0xffff)))
 				c = 0;
 			if (c == K_REP) {
 				/* the repeated instruction must follow, native and one
@@ -1577,6 +1688,7 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 		} else if (k) {
 			len = jit_len(w);
 			if (len == 2 && !jit_psrc(a + 1)) break;
+			if (k == K_NAT && w < 0x100000 && jit_bit_ea(w) && (*jit_psrc(a + 1) & 0xffff) >= 0x100) k = K_INT;
 		}
 		if (!k) break;
 		if (!jit_add_pages(a, a + len - 1)) break;
@@ -1600,7 +1712,7 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 			a = tgt;
 			continue;
 		}
-		if (k == K_JCC) {
+		if (k == K_JCC || k == K_JB) {
 			has_jump = 1;
 			if (tgt == pc && !eagu) iback[n - 1] = 1;
 			a += len;
@@ -1725,7 +1837,7 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 				ldr(R0, SP, S_AGUV);
 				strh_core(R0, offsetof(dsp_core_t, agu_pipeline_val[0]));
 			}
-			if (ik[i] == K_JMP || ik[i] == K_JCC) {
+			if (ik[i] == K_JMP || ik[i] == K_JCC || ik[i] == K_JB) {
 				dpi(AL, OP_MOV, 0, R10, 0, icy[i]);
 			} else if (!jit_mem_inst(iw[i])) {
 				jit_lazy = lz; jit_xcyc = 0; jit_w2 = iw2[i];
@@ -1762,10 +1874,11 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 			if (iback[i]) gen_back(body, i + 1, i + 1, epc[i], 0);
 			continue;
 		}
-		if (ik[i] == K_JCC) {
+		if (ik[i] == K_JCC || ik[i] == K_JB) {
 			uint32_t *nt;
 			jit_prev_agu = 0;
-			gen_cc(icc[i]);
+			if (ik[i] == K_JB) gen_bitcc(iw[i]);
+			else gen_cc(icc[i]);
 			if (iback[i]) {
 				nt = bcc(EQ);
 				gen_back(body, i + 1, i + 1, itg[i], 0);
@@ -1992,10 +2105,10 @@ int dsp56k_jit_step(uint32_t *cycles)
 	slot = &jit_tab[JIT_IDX(pc)];
 	b = *slot;
 	if (!b || (b->start != pc && ++dsp_jit_stats[4]) || (!jit_valid(b) && ++dsp_jit_stats[5]) ||
-	    (b->n && lf && la >= b->start && la < b->last && ++dsp_jit_stats[6]) ||
+	    (b->n && lf && !(b->jumps && b->clip == la) && la >= b->start && la < b->last && ++dsp_jit_stats[6]) ||
 	    (b->clip != 0xffff && !(lf && la == b->clip) && ++dsp_jit_stats[7]) ||
 	    (b->scal != ((dsp_core.registers[DSP_REG_SR] >> DSP_SR_S0) & 3) && ++dsp_jit_stats[5]) ||
-	    (b->jumps && lf && ++dsp_jit_stats[7]) ||
+	    (b->jumps && lf && b->clip != la && ++dsp_jit_stats[7]) ||
 	    (b->mmask && !jit_m_ok(b) && ++dsp_jit_stats[5])) {
 		/* (a block clipped at an LA is kept only while that loop runs) */
 		b = jit_compile(pc, lf && la >= pc ? la : 0xffff, lf, eagu);

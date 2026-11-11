@@ -186,6 +186,11 @@ static int replay(const char *path, long n, int pc)
 			dsp_jit_ihist[bp] = 0;
 		}
 	}
+	if (jit_on()) {
+		printf("interp why:");
+		for (int i = 0; i < 10; i++) printf(" %u", dsp_jit_why[i]);
+		printf(" (boot rep omrwait fastint agu trace intpend noblock agumis off)\n");
+	}
 	if (jit_on()) printf("jit: %u blocks, %u instructions in blocks, %u interpreted, %u compiles (other start %u, changed %u, LA inside %u, clip %u)\n", dsp_jit_stats[0], dsp_jit_stats[1], dsp_jit_stats[2], dsp_jit_stats[3], dsp_jit_stats[4], dsp_jit_stats[5], dsp_jit_stats[6], dsp_jit_stats[7]);
 	printf("replay %s from %04x: %ld instr in %.3f s CPU = %5.2f MIPS  pc %04x\n", path, pc >= 0 ? pc : h.pc, n, t1 - t0,
 	       n / (t1 - t0) / 1e6, dsp_core.pc);
