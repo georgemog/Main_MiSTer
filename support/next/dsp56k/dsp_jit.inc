@@ -691,7 +691,7 @@ static int jit_dbg;			/* NEXT_DSP_JIT_DBG=1: record each instruction's cycles (t
 uint32_t dsp_jit_dbg[2 * JIT_MAX + 4];
 uint32_t *dsp_jit_ihist;			/* tests: interpreted instructions per PC (set by the caller) */
 uint32_t *dsp_jit_khist;			/* tests: Hatari handlers run inside blocks (jit_interp) per PC */
-uint32_t dsp_jit_why[16];			/* interpreted steps by reason: boot ROM, REP, OMR wait, fast
+uint32_t dsp_jit_why[20];			/* interpreted steps by reason: boot ROM, REP, OMR wait, fast
 						   interrupt, AGU delay, trace, interrupt pending, no block,
 						   AGU mismatch, off */	/* [i]: cycles of the block's instruction i, [JIT_MAX + i] the block's cycles so far */
 static void jit_dbg_rec(uint32_t i, uint32_t cycles, uint32_t bits)
@@ -1628,12 +1628,12 @@ static void gen_cc(uint32_t cc)
 	dpi(AL, OP_CMP, 1, 0, R0, 0);
 }
 
-static void *jit_next(uint32_t pc, uint32_t rc);
+static void *jit_next(uint32_t pc, uint32_t len, uint32_t rc);
 
 static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 {
 	jit_block_t *b;
-	uint32_t *start, *body, *to_end[4], *lbl[JIT_MAX];
+	uint32_t *start, *body, *centry, *to_end[4], *lbl[JIT_MAX];
 	int nend = 0;
 	uint16_t ia[JIT_MAX], itg[JIT_MAX], epc[JIT_MAX], elen[JIT_MAX];
 	uint8_t il[JIT_MAX], ik[JIT_MAX], icy[JIT_MAX], iback[JIT_MAX], icc[JIT_MAX], irep[JIT_MAX];
@@ -1796,6 +1796,7 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 	if (jit_rc) rc_reload();
 	dpi(AL, OP_MOV, 0, R5, 0, 0);
 	str(R5, SP, S_CNT);
+	centry = ep;			/* (a chained block jumps in here: before the entry AGU delay's staging) */
 	if (eagu && (ik[0] == K_INT || ik[0] == K_REP || ik[0] == K_DO || ik[0] == K_TAIL)) {
 		/* stage it as if the previous instruction had just made it, for
 		   the handler's own pipeline step: [1] = [0], [0] = 0 */
@@ -2028,9 +2029,9 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 			str(R0, SP, S_CNT);
 			str(R1, SP, S_ADDR1);
 			str(R2, SP, S_ADDR2);
-			dpr(AL, OP_ADD, 0, R0, R1, R2, 0, 0);
-			ubfx(R0, R0, 0, 16);
-			dpi(AL, OP_MOV, 0, R1, 0, jit_rc);
+			dpr(AL, OP_MOV, 0, R0, 0, R1, 0, 0);
+			dpr(AL, OP_MOV, 0, R1, 0, R2, 0, 0);
+			dpi(AL, OP_MOV, 0, R2, 0, jit_rc);
 			call((const void *)jit_next);
 			dpi(AL, OP_CMP, 1, 0, R0, 0);
 			no3 = bcc(EQ);
@@ -2065,7 +2066,7 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 	b->mmask = jit_mmask;
 	for (i = 0; i < 8; i++) b->m[i] = jit_m[i];
 	b->code = (void (*)(void))start;
-	b->body = body;
+	b->body = centry;
 	b->rc = jit_rc;
 	jit_ptr = (uint8_t *)ep;
 	return b;
@@ -2093,28 +2094,50 @@ static int jit_valid(jit_block_t *b)
 	return 1;
 }
 
-/* the next block for a chained exit at pc (jit_post's plain case, then
-   dsp56k_jit_step's checks): its body, or NULL to return instead */
-static void *jit_next(uint32_t pc, uint32_t rc)
+/* the next block for a chained exit (pc, len as for jit_post): jit_post's
+   plain case or a DO loop going round again, then dsp56k_jit_step's checks;
+   its body, or NULL to return instead (nothing changed then) */
+static void *jit_next(uint32_t pc, uint32_t len, uint32_t rc)
 {
 	jit_block_t *b;
-	uint32_t sr = dsp_core.registers[DSP_REG_SR];
-	if (dsp_core.agu_pipeline_reg[1] || dsp_core.loop_rep || dsp_core.mode_wait || dsp_core.mode == 1 ||
-	    (sr & ((1 << DSP_SR_LF) | (1 << DSP_SR_T))) || dsp_core.interrupt_state == DSP_INTERRUPT_DISABLED ||
+	uint32_t sr = dsp_core.registers[DSP_REG_SR], la, npc, lf, again = 0;
+	uint32_t eagu = dsp_core.agu_pipeline_reg[1];	/* (jit_post moves it to [0]: the next block's entry delay) */
+	if ((eagu && (eagu < DSP_REG_R0 || eagu > DSP_REG_M7)) || dsp_core.loop_rep || dsp_core.mode_wait || dsp_core.mode == 1 ||
+	    (sr & (1 << DSP_SR_T)) || dsp_core.interrupt_state == DSP_INTERRUPT_DISABLED ||
 	    (dsp_core.interrupt_status & DSP_INTER_NMI_MASK) ||
 	    (dsp_core.interrupt_status & dsp_core.interrupt_enable & dsp_core.interrupt_mask)) {
-		dsp_jit_why[(sr >> DSP_SR_LF) & 1 ? 13 : 14]++;
+		dsp_jit_why[14]++;
+		dsp_jit_why[eagu ? 16 : dsp_core.loop_rep ? 17 : 18]++;
 		return NULL;
 	}
-	b = jit_tab[JIT_IDX(pc)];
-	if (!b || b->start != pc || !b->n || !b->code || b->eagu || b->clip != 0xffff || b->rc != rc ||
-	    b->scal != ((sr >> DSP_SR_S0) & 3) || !jit_valid(b) || (b->mmask && !jit_m_ok(b))) {
+	npc = (pc + len) & 0xffff;
+	lf = (sr >> DSP_SR_LF) & 1;
+	la = dsp_core.registers[DSP_REG_LA];
+	if (lf && npc == la + 1) {
+		/* the DO loop's last instruction: round again (its end, which
+		   pops the stack, is left to dsp_postexecute_update_pc) */
+		if (dsp_core.registers[DSP_REG_LC] == 1) { dsp_jit_why[13]++; return NULL; }
+		npc = dsp_core.registers[DSP_REG_SSH] & 0xffff;
+		again = 1;
+	}
+	b = jit_tab[JIT_IDX(npc)];
+	if (!b || b->start != npc || !b->n || !b->code || b->eagu != eagu || b->rc != rc ||
+	    b->scal != ((sr >> DSP_SR_S0) & 3) ||
+	    (lf && !(b->jumps && b->clip == la) && la >= b->start && la < b->last) ||
+	    (b->clip != 0xffff && !(lf && la == b->clip)) ||
+	    (b->jumps && lf && b->clip != la) ||
+	    !jit_valid(b) || (b->mmask && !jit_m_ok(b))) {
 		dsp_jit_why[15]++;
 		return NULL;
 	}
+	if (again) dsp_core.registers[DSP_REG_LC] = (dsp_core.registers[DSP_REG_LC] - 1) & BITMASK(16);
+	dsp_core.agu_pipeline_reg[0] = eagu;
+	if (eagu) {
+		dsp_core.agu_pipeline_val[0] = dsp_core.agu_pipeline_val[1];
+		dsp_core.agu_pipeline_reg[1] = 0;
+	}
+	dsp_core.pc = npc;
 	dsp_jit_why[12]++;
-	dsp_core.agu_pipeline_reg[0] = 0;
-	dsp_core.pc = pc;
 	dsp_jit_stats[0]++;
 	return b->body;
 }
@@ -2290,7 +2313,7 @@ interp:
 uint32_t dsp_jit_stats[8];
 uint32_t dsp_jit_dbg[68];
 uint32_t *dsp_jit_ihist, *dsp_jit_khist;
-uint32_t dsp_jit_why[16];
+uint32_t dsp_jit_why[20];
 
 void dsp56k_jit_flush(void) {}
 

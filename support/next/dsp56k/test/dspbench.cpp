@@ -190,7 +190,8 @@ static int replay(const char *path, long n, int pc)
 		printf("interp why:");
 		for (int i = 0; i < 10; i++) printf(" %u", dsp_jit_why[i]);
 		printf(" (boot rep omrwait fastint agu trace intpend noblock agumis off)\n");
-		printf("chain: %u chained, %u refused in a DO loop, %u refused (state), %u refused (block)\n", dsp_jit_why[12], dsp_jit_why[13], dsp_jit_why[14], dsp_jit_why[15]);
+		printf("chain: %u chained, %u refused at a DO loop end, %u refused (state), %u refused (block)\n", dsp_jit_why[12], dsp_jit_why[13], dsp_jit_why[14], dsp_jit_why[15]);
+		printf("  state: agu %u rep %u other %u\n", dsp_jit_why[16], dsp_jit_why[17], dsp_jit_why[18]);
 	}
 	if (jit_on()) printf("jit: %u blocks, %u instructions in blocks, %u interpreted, %u compiles (other start %u, changed %u, LA inside %u, clip %u)\n", dsp_jit_stats[0], dsp_jit_stats[1], dsp_jit_stats[2], dsp_jit_stats[3], dsp_jit_stats[4], dsp_jit_stats[5], dsp_jit_stats[6], dsp_jit_stats[7]);
 	printf("replay %s from %04x: %ld instr in %.3f s CPU = %5.2f MIPS  pc %04x\n", path, pc >= 0 ? pc : h.pc, n, t1 - t0,
