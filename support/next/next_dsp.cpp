@@ -820,6 +820,23 @@ static int trace_dump(const char *path)
 	return r;
 }
 
+// the bootstrap ROM waiting for the host (p:$13 JCLR #3,X:$FFE9 / p:$17
+// JCLR #0,X:(R2) with R2 = $FFE9): with HF0 and HRDF clear a pass changes
+// nothing but the cycle count, and only a host write sets them, so don't
+// spin there (the thread sleeps until the link brings something)
+static int boot_idle(void)
+{
+	return dsp_core.mode == 1 && (dsp_core.pc == 0x13 || dsp_core.pc == 0x17) &&
+	       dsp_core.registers[DSP_REG_R2] == 0xffe9 &&
+	       !(dsp_core.periph[DSP_SPACE_X][DSP_HOST_HSR] & ((1 << DSP_HOST_HSR_HRDF) | (1 << DSP_HOST_HSR_HF0))) &&
+	       !dsp_core.loop_rep && !dsp_core.mode_wait && dsp_core.interrupt_state == DSP_INTERRUPT_NONE &&
+	       !dsp_core.agu_pipeline_reg[0] && !dsp_core.agu_pipeline_reg[1] &&
+	       !(dsp_core.registers[DSP_REG_SR] & (1 << DSP_SR_T)) &&
+	       !(dsp_core.interrupt_status & DSP_INTER_NMI_MASK) &&
+	       !(dsp_core.interrupt_status & dsp_core.interrupt_enable & dsp_core.interrupt_mask);
+}
+static uint64_t st_boot_idle;            // link slices that found the bootstrap ROM idle
+
 #define STARVED_POLL   16                // instructions between ring polls while starved (a power of 2)
 
 static int link_step(int n)
@@ -837,6 +854,7 @@ static int link_step(int n)
 	while (done < n && dsp_core.running && pend_n < PENDQ_N / 2)
 	{
 		int k = 1;
+		if (boot_idle()) { st_boot_idle++; break; }
 		if (prof_on) { prof_execute(); step_cycles += dsp_core.instr_cycle; st_cycles += dsp_core.instr_cycle; }
 		else
 		{
@@ -973,6 +991,7 @@ static void stats_poll(void)
 	static int n, on;
 	static uint64_t w0, cpu0, i0, c0, s0, b0;
 	static uint32_t j0[8], y0[20];
+	static uint64_t bi0;
 	struct timespec ts;
 	if (++n < 20) return;		// (called every ~100 ms)
 	n = 0;
@@ -989,7 +1008,7 @@ static void stats_poll(void)
 		     (instrs - i0) * 1e3 / dw, (st_cycles - c0) * 1e3 / dw,
 		     (unsigned long long)(st_behind - b0),
 		     dsp_jit_stats[0] - j0[0], dsp_jit_stats[2] - j0[2], dsp_jit_stats[3] - j0[3],
-		     dsp_core.running ? "" : "  (DSP in reset)");
+		     !dsp_core.running ? "  (DSP in reset)" : st_boot_idle != bi0 ? "  (bootstrap ROM idle)" : "");
 		/* why steps were interpreted, recompile reasons, and the most
 		   interpreted PCs since the last line */
 		fprintf(f, "      interp why: boot %u rep %u omrwait %u fastint %u agu %u trace %u intpend %u noblock %u agumis %u  recompile: start %u changed %u lainside %u clip %u  kept %u  irq fast %u\n      chain: %u, no: loop end %u state %u block %u\n",
@@ -1015,7 +1034,7 @@ static void stats_poll(void)
 	if (armed && !dsp_jit_ihist) dsp_jit_ihist = (uint32_t *)calloc(65536, 4);
 out:
 	on = armed;
-	w0 = w; cpu0 = cpu; i0 = instrs; c0 = st_cycles; s0 = st_sleep_ns; b0 = st_behind;
+	w0 = w; cpu0 = cpu; i0 = instrs; c0 = st_cycles; s0 = st_sleep_ns; b0 = st_behind; bi0 = st_boot_idle;
 	memcpy(j0, dsp_jit_stats, sizeof(j0));
 	memcpy(y0, dsp_jit_why, sizeof(y0));
 }
@@ -1024,6 +1043,7 @@ static void *dsp_thread(void *)
 {
 	uint64_t t0 = now_ns(), last_dbg = 0;
 	step_cycles = 0;
+	uint32_t idle_run = 0;
 
 	while (thr_run)
 	{
@@ -1045,8 +1065,11 @@ static void *dsp_thread(void *)
 		}
 		if (!dsp_core.running || n == 0)
 		{
-			// in reset, or held: the FPGA polls every 4 us while it runs
-			usleep(dsp_core.running ? 20 : 500);
+			// in reset, or held: the FPGA polls every 4 us while it runs.
+			// Idle in the bootstrap ROM for a while (no program being
+			// loaded): poll the link as seldom as in reset
+			idle_run = n == 0 && dsp_core.running && boot_idle() ? idle_run + 1 : 0;
+			usleep(!dsp_core.running || idle_run > 200 ? 500 : 20);
 			t0 = now_ns(); step_cycles = 0;
 			continue;
 		}
