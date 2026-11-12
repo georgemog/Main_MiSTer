@@ -105,7 +105,8 @@ static void nlog(const char *fmt, ...)
 // the link's event trace: the last TRACE_N host-port events, for a hang
 // (written with the link state by the "trace" trigger file, see profiling)
 enum { EV_H2D = 1, EV_HOLD, EV_PARK, EV_UNPARK, EV_D2H, EV_HCTAKEN, EV_HIRESET, EV_SKIPRESET };
-struct trace_ev { uint64_t instrs; uint16_t pc; uint8_t kind, type; uint32_t data; };
+struct trace_ev { uint64_t instrs; uint32_t us; uint16_t pc; uint8_t kind, type; uint32_t data; };
+static int hf3_auto;                     // HF3 seen: dump the trace once (hf3_auto.txt)
 #define TRACE_N 65536
 static trace_ev trace_buf[TRACE_N];
 static uint32_t trace_n;
@@ -276,7 +277,10 @@ static uint8_t isr(void) { return dsp_core.hostport[CPU_HOST_ISR]; }
 static void trace(int kind, int type, uint32_t data)
 {
 	trace_ev &e = trace_buf[trace_n++ % TRACE_N];
-	e.instrs = instrs; e.pc = (uint16_t)dsp_core.pc; e.kind = (uint8_t)kind; e.type = (uint8_t)type; e.data = data;
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	e.instrs = instrs; e.us = (uint32_t)(ts.tv_sec * 1000000ull + ts.tv_nsec / 1000);
+	e.pc = (uint16_t)dsp_core.pc; e.kind = (uint8_t)kind; e.type = (uint8_t)type; e.data = data;
 }
 
 // local TX empty: every word sent has been read by the DSP
@@ -336,6 +340,7 @@ static void service(void)
 	{
 		last_hf = hf;
 		d2h(R_FLAGS, hf);
+		if ((hf & (1 << CPU_HOST_ISR_HF3)) && !hf3_auto) hf3_auto = 1;
 	}
 
 	switch (hc_state)
@@ -808,13 +813,13 @@ static int trace_dump(const char *path)
 		fprintf(f, "  [%u] %-8s %06x epoch %02x\n", i, t < 9 ? hn[t] : "?", (unsigned)(m & 0xFFFFFF), (unsigned)(uint8_t)(m >> 48));
 	}
 	uint32_t n = trace_n < TRACE_N ? trace_n : TRACE_N;
-	fprintf(f, "\nlast %u events (instrs, pc, event):\n", n);
+	fprintf(f, "\nlast %u events (instrs, us, pc, event):\n", n);
 	for (uint32_t k = trace_n - n; k != trace_n; k++)
 	{
 		const trace_ev &e = trace_buf[k % TRACE_N];
 		const char *tn = e.kind == EV_D2H ? (e.type < 7 ? dn[e.type] : "?") : (e.type < 9 ? hn[e.type] : "?");
 		if (e.kind == EV_HCTAKEN || e.kind == EV_HIRESET) tn = "";
-		fprintf(f, "%12llu %04x %-13s %-8s %06x\n", (unsigned long long)e.instrs, e.pc,
+		fprintf(f, "%12llu %10u %04x %-13s %-8s %06x\n", (unsigned long long)e.instrs, e.us, e.pc,
 		        e.kind < 9 ? kn[e.kind] : "?", tn, e.data);
 	}
 	int r = ferror(f) ? -1 : 0;
@@ -974,6 +979,18 @@ static void knob_poll(void)
 
 static void trace_poll(void)
 {
+	// HF3 seen (the Music Kit's TMQ full) while NEXT_DSP_DIR/hf3arm exists:
+	// the trace up to it, once
+	if (hf3_auto == 1)
+	{
+		hf3_auto = 2;
+		if (access(NEXT_DSP_DIR "/hf3arm", F_OK) == 0)
+		{
+			unlink(NEXT_DSP_DIR "/hf3arm");
+			trace_dump(NEXT_DSP_DIR "/hf3_auto.txt");
+		}
+		else hf3_auto = 0;
+	}
 	FILE *f = fopen(NEXT_DSP_DIR "/trace", "r");
 	if (!f) return;
 	char label[64] = "trace";
