@@ -56,6 +56,8 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 
 #include "next_dsp.h"
 #include "../../shmem.h"
@@ -1044,6 +1046,14 @@ static void *dsp_thread(void *)
 	uint64_t t0 = now_ns(), last_dbg = 0;
 	step_cycles = 0;
 	uint32_t idle_run = 0;
+
+	// CPU 0 is shared with the rest of Linux (sshd, offload, USB writes);
+	// a busy task there at the same priority starved this thread, the
+	// DSP fell behind and the Music Kit aborted the score and hung waiting
+	// for a DSP left in the bootstrap ROM.  At nice -20 it still sleeps
+	// when ahead, but ordinary work can no longer push it behind.
+	if (setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), -20))
+		nlog("dsp thread: setpriority failed\n");
 
 	while (thr_run)
 	{
