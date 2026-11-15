@@ -51,6 +51,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <errno.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -58,6 +59,9 @@
 #include <sched.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 #include "next_dsp.h"
 #include "../../shmem.h"
@@ -1071,6 +1075,11 @@ static void *dsp_thread(void *)
 	// when ahead, but ordinary work can no longer push it behind.
 	if (setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), -20))
 		nlog("dsp thread: setpriority failed\n");
+	// a normal-policy thread's sleeps may end up to 50 us late (timer
+	// slack, which nice does not change): the 20 us link polls and the
+	// pacing sleep want their wakeups on time
+	if (prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0))
+		nlog("dsp thread: PR_SET_TIMERSLACK failed\n");
 
 	while (thr_run)
 	{
@@ -1105,8 +1114,10 @@ static void *dsp_thread(void *)
 		uint64_t due = t0 + step_cycles * 1000000000ull / DSP_HZ;
 		if (due > t + 200000)
 		{
-			struct timespec ts = { 0, (long)(due - t) };
-			nanosleep(&ts, NULL);
+			// to the deadline itself, so time spent between reading the
+			// clock and sleeping is not added on
+			struct timespec ts = { (time_t)(due / 1000000000ull), (long)(due % 1000000000ull) };
+			while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
 			if (prof_on) prof_sleep += due - t;
 			st_sleep_ns += due - t;
 		}
@@ -1137,6 +1148,13 @@ void next_dsp_start(void)
 	// an ARM word left by an earlier core load must not link the new FPGA
 	wr64(OFF_ARM, 0);
 	thr_run = 1;
+
+	// the JIT's buffers and switches now, on Main's thread: not mapped,
+	// allocated and faulted in by the DSP thread's first step
+	if (dsp56k_jit_init() == 0)
+		nlog("JIT on, code buffer %s\n", dsp56k_jit_mapping() == 2 ? "W + RX views" : "RWX");
+	else
+		nlog("JIT off\n");
 
 	pthread_attr_t attr;
 	pthread_attr_init(&attr);

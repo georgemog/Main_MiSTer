@@ -81,6 +81,10 @@
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <stddef.h>
+#include <unistd.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 
 #define JIT_MAX		32		/* instructions per block */
 #define JIT_CODE_SIZE	(2 << 20)
@@ -109,7 +113,13 @@ typedef struct jit_block_s {
 } jit_block_t;
 
 static struct { uint32_t n, pc, len, cycles; } jit_out;
+/* the code buffer: jit_mem is the view the emitter writes, which is not
+   executable; the same pages are mapped again read/execute, jit_xoff bytes
+   on (jit_map).  Only addresses that are run (b->code, b->body) and the
+   cache flush use the executable view; branches are pc-relative. */
 static uint8_t *jit_mem, *jit_ptr;
+static ptrdiff_t jit_xoff;
+#define JIT_X(p)	((void *)((uint8_t *)(p) + jit_xoff))
 static jit_block_t *jit_tab[JIT_HASH];
 static uint8_t jit_cc[16][128];		/* condition code x SR bits 0..6 (dsp_calc_cc) */
 
@@ -1478,8 +1488,50 @@ static void jit_flush(void)
 	jit_ramsize = DSP_RAMSIZE;
 }
 
+/* the code buffer, mapped twice from one memfd (write, read/execute), so
+   no page is writable and executable at once; else one RWX mapping (no
+   memfd: not Linux, or an old kernel).  Pages are populated now, not
+   faulted in while blocks compile. */
+static int jit_map(void)
+{
+#ifndef MAP_POPULATE
+#define MAP_POPULATE 0
+#endif
+#if defined(__linux__) && defined(SYS_memfd_create)
+	int fd = (int)syscall(SYS_memfd_create, "dsp56k-jit", 1u /* MFD_CLOEXEC */);
+	if (fd >= 0) {
+		if (ftruncate(fd, JIT_CODE_SIZE) == 0) {
+			void *w = mmap(NULL, JIT_CODE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, 0);
+			void *x = w == MAP_FAILED ? MAP_FAILED :
+				  mmap(NULL, JIT_CODE_SIZE, PROT_READ | PROT_EXEC, MAP_SHARED | MAP_POPULATE, fd, 0);
+			if (x != MAP_FAILED) {
+				close(fd);
+				jit_mem = (uint8_t *)w;
+				jit_xoff = (uint8_t *)x - (uint8_t *)w;
+				return 0;
+			}
+			if (w != MAP_FAILED) munmap(w, JIT_CODE_SIZE);
+		}
+		close(fd);
+	}
+#endif
+	void *m = mmap(NULL, JIT_CODE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+	if (m == MAP_FAILED) return -1;
+	jit_mem = (uint8_t *)m;
+	jit_xoff = 0;
+	return 0;
+}
+
+/* how the code buffer is mapped: 2 write + read/execute views, 1 RWX, 0 none */
+int dsp56k_jit_mapping(void)
+{
+	return !jit_mem ? 0 : jit_xoff ? 2 : 1;
+}
+
 static int jit_init(void)
 {
+	if (jit_mem) return 0;
+	if (jit_off) return -1;
 	const char *e = getenv("NEXT_DSP_JIT");
 	if (e && *e == '0') { jit_off = 1; return -1; }
 	e = getenv("NEXT_DSP_JIT_MAX");
@@ -1492,14 +1544,24 @@ static int jit_init(void)
 	if (e && *e == '0') jit_rc_off = 1;
 	e = getenv("NEXT_DSP_JIT_ALU");
 	if (e && *e == '0') jit_alu_off = 1;
-	jit_mem = mmap(NULL, JIT_CODE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (jit_mem == MAP_FAILED) { jit_mem = NULL; jit_off = 1; return -1; }
+	jit_pool = calloc(JIT_POOL, sizeof(jit_block_t));
+	if (!jit_pool || jit_map()) { free(jit_pool); jit_pool = NULL; jit_mem = NULL; jit_off = 1; return -1; }
 	for (int cc = 0; cc < 16; cc++)
 		for (int sr = 0; sr < 128; sr++) jit_cc[cc][sr] = jit_cc_eval(cc, sr);
-	jit_pool = calloc(JIT_POOL, sizeof(jit_block_t));
-	if (!jit_pool) { jit_off = 1; return -1; }
+	/* keep the JIT's memory resident: no page faults on the DSP thread
+	   (best effort: fails without CAP_IPC_LOCK over RLIMIT_MEMLOCK) */
+	mlock(jit_pool, JIT_POOL * sizeof(jit_block_t));
+	mlock(jit_tab, sizeof(jit_tab));
+	mlock(jit_mem, JIT_CODE_SIZE);
 	jit_flush();
 	return 0;
+}
+
+/* set the JIT up now (reads the NEXT_DSP_JIT* switches), from the thread
+   that starts the DSP, instead of on the first step; 0 when it is on */
+int dsp56k_jit_init(void)
+{
+	return jit_init();
 }
 
 /* control instructions compiled into blocks (step 4) */
@@ -2062,11 +2124,12 @@ static jit_block_t *jit_compile(uint16_t pc, uint16_t clip, int lf, int eagu)
 		jit_flush();
 		return NULL;
 	}
-	__builtin___clear_cache((char *)start, (char *)ep);
+	/* (by the addresses the code runs at: the I-cache is indexed by them) */
+	__builtin___clear_cache((char *)JIT_X(start), (char *)JIT_X(ep));
 	b->mmask = jit_mmask;
 	for (i = 0; i < 8; i++) b->m[i] = jit_m[i];
-	b->code = (void (*)(void))start;
-	b->body = centry;
+	b->code = (void (*)(void))JIT_X(start);
+	b->body = JIT_X(centry);
 	b->rc = jit_rc;
 	jit_ptr = (uint8_t *)ep;
 	return b;
@@ -2316,6 +2379,8 @@ uint32_t *dsp_jit_ihist, *dsp_jit_khist;
 uint32_t dsp_jit_why[20];
 
 void dsp56k_jit_flush(void) {}
+int dsp56k_jit_init(void) { return -1; }
+int dsp56k_jit_mapping(void) { return 0; }
 
 int dsp56k_jit_step(uint32_t *cycles)
 {

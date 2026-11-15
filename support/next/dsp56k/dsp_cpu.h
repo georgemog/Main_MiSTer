@@ -119,6 +119,8 @@ extern uint32_t dsp_jit_stats[8];
 extern uint32_t *dsp_jit_ihist, *dsp_jit_khist;
 extern uint32_t dsp_jit_why[20];
 extern void dsp56k_jit_flush(void);	/* after writing memory directly */
+extern int dsp56k_jit_init(void);	/* set up before the first step (else the first step does); 0: JIT on */
+extern int dsp56k_jit_mapping(void);	/* code buffer: 2 W + RX views, 1 RWX, 0 none */
 extern uint16_t dsp56k_execute_one_disasm_instruction(FILE *out, uint16_t pc);	/* Execute 1 instruction in disasm mode */
 
 /* Interrupt relative functions */
