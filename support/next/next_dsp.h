@@ -35,4 +35,11 @@ int  next_dsp_sim_step(int n);
 void next_dsp_prof(int on);
 int  next_dsp_prof_dump(const char *path);
 
+// Host-stall diagnosis, called from Main's thread: one NeXT disk request
+// (times from next_dsp_now_us, CLOCK_MONOTONIC), and one call per
+// user_io_poll pass.  They go into the link trace's timeline and stats.log.
+uint32_t next_dsp_now_us(void);
+void next_dsp_note_disk(int disk, int op, uint32_t lba, uint32_t sz, uint32_t t0_us, uint32_t t1_us);
+void next_dsp_main_tick(void);
+
 #endif

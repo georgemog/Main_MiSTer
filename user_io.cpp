@@ -3411,6 +3411,9 @@ void user_io_poll()
 		if (is_snes() || is_sgb()) snes_poll();
 		mdplus_poll(); // MD+ CDDA poll
 
+		const bool nx = is_next();
+		if (nx) next_dsp_main_tick();
+
 		for (int i = 0; i < 4; i++)
 		{
 			int disk = -1;
@@ -3418,7 +3421,14 @@ void user_io_poll()
 			int op = 0;
 			static uint8_t buffer[16][UIO_BUFFER_SIZE];
 			uint64_t lba = 0;
-			uint32_t blksz, blks, sz;
+			uint32_t blksz, blks, sz = 0;
+
+			// NeXT: time each request, read-ahead included (support/next/next_dsp.cpp trace)
+			struct next_disk_timer
+			{
+				bool on; const int &disk, &op; const uint64_t &lba; const uint32_t &sz; uint32_t t0;
+				~next_disk_timer() { if (on && disk >= 0 && op) next_dsp_note_disk(disk, op, (uint32_t)lba, sz, t0, next_dsp_now_us()); }
+			} next_timer = { nx, disk, op, lba, sz, nx ? next_dsp_now_us() : 0 };
 
 			if (is_uneon() && i == 3)
 			{

@@ -62,6 +62,7 @@
 #ifdef __linux__
 #include <sys/prctl.h>
 #endif
+#include <algorithm>
 
 #include "next_dsp.h"
 #include "../../shmem.h"
@@ -108,13 +109,23 @@ static void nlog(const char *fmt, ...)
 
 // the link's event trace: the last TRACE_N host-port events, for a hang
 // (written with the link state by the "trace" trigger file, see profiling)
-enum { EV_H2D = 1, EV_HOLD, EV_PARK, EV_UNPARK, EV_D2H, EV_HCTAKEN, EV_HIRESET, EV_SKIPRESET };
+enum { EV_H2D = 1, EV_HOLD, EV_PARK, EV_UNPARK, EV_D2H, EV_HCTAKEN, EV_HIRESET, EV_SKIPRESET, EV_OVERSLEEP };
 struct trace_ev { uint64_t instrs; uint32_t us; uint16_t pc; uint8_t kind, type; uint32_t data; };
 static int hf3_auto;                     // HF3 seen: dump the trace once (hf3_auto.txt)
 #define TRACE_N 65536
 static trace_ev trace_buf[TRACE_N];
 static uint32_t trace_n;
 static void trace(int kind, int type, uint32_t data);
+
+// Main's thread's side of the trace: NeXT disk requests and user_io_poll
+// gaps (op DISK_GAP), written only by Main's thread, read by trace_dump
+enum { DISK_GAP = 0xFF, DISK_GAP_US = 2000, DISK_SLOW_US = 5000, OVERSLEEP_US = 1000, HOST_GAP_US = 15000 };
+static uint32_t st_host_gap_max, st_host_gaps;
+struct disk_ev { uint32_t t0, dur, lba, sz; uint8_t disk, op; };
+#define DISK_N 8192
+static disk_ev disk_buf[DISK_N];
+static uint32_t disk_n;                  // (atomic: Main's thread stores, the DSP thread loads)
+static uint32_t st_disk_reqs, st_disk_slow, st_disk_max, st_disk_us, st_main_max, st_oversleep_max, st_oversleeps;
 
 // the DSP's external RAM (DSP_EnableMemory)
 static uint32_t dsp_ram[32768];
@@ -285,6 +296,60 @@ static void trace(int kind, int type, uint32_t data)
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	e.instrs = instrs; e.us = (uint32_t)(ts.tv_sec * 1000000ull + ts.tv_nsec / 1000);
 	e.pc = (uint16_t)dsp_core.pc; e.kind = (uint8_t)kind; e.type = (uint8_t)type; e.data = data;
+	if (kind == EV_H2D)
+	{
+		// the host's longest silence (no message at all) while the DSP runs
+		static uint32_t last;
+		uint32_t d = e.us - last;
+		if (dsp_core.running && last)
+		{
+			if (d > st_host_gap_max) st_host_gap_max = d;
+			if (d >= HOST_GAP_US) st_host_gaps++;
+		}
+		last = e.us;
+	}
+}
+
+uint32_t next_dsp_now_us(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint32_t)(ts.tv_sec * 1000000ull + ts.tv_nsec / 1000);
+}
+
+static void disk_push(int disk, int op, uint32_t lba, uint32_t sz, uint32_t t0, uint32_t dur)
+{
+	uint32_t n = __atomic_load_n(&disk_n, __ATOMIC_RELAXED);
+	disk_ev &e = disk_buf[n % DISK_N];
+	e.t0 = t0; e.dur = dur; e.lba = lba; e.sz = sz; e.disk = (uint8_t)disk; e.op = (uint8_t)op;
+	__atomic_store_n(&disk_n, n + 1, __ATOMIC_RELEASE);
+}
+
+static void atomic_max(uint32_t *p, uint32_t v)
+{
+	if (v > __atomic_load_n(p, __ATOMIC_RELAXED)) __atomic_store_n(p, v, __ATOMIC_RELAXED);
+}
+
+void next_dsp_note_disk(int disk, int op, uint32_t lba, uint32_t sz, uint32_t t0_us, uint32_t t1_us)
+{
+	uint32_t dur = t1_us - t0_us;
+	disk_push(disk, op, lba, sz, t0_us, dur);
+	__atomic_add_fetch(&st_disk_reqs, 1, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&st_disk_us, dur, __ATOMIC_RELAXED);
+	if (dur >= DISK_SLOW_US) __atomic_add_fetch(&st_disk_slow, 1, __ATOMIC_RELAXED);
+	atomic_max(&st_disk_max, dur);
+}
+
+void next_dsp_main_tick(void)
+{
+	static uint32_t last;
+	uint32_t now = next_dsp_now_us(), d = now - last;
+	if (last)
+	{
+		if (d >= DISK_GAP_US) disk_push(0, DISK_GAP, 0, 0, last, d);
+		atomic_max(&st_main_max, d);
+	}
+	last = now;
 }
 
 // local TX empty: every word sent has been read by the DSP
@@ -789,7 +854,7 @@ static int trace_dump(const char *path)
 {
 	static const char *hn[] = { "?", "T_TX", "T_ICR", "T_CVR", "T_RXACK", "T_RESET", "T_START", "T_MEM", "T_IRQB" };
 	static const char *dn[] = { "?", "R_RX", "R_HRXACK", "R_FLAGS", "R_HCACK", "R_TXD", "R_HIRESET" };
-	static const char *kn[] = { "?", "h2d", "HOLD", "PARK", "UNPARK", "d2h", "HC-TAKEN", "HI-RESET", "SKIP-TO-RESET" };
+	static const char *kn[] = { "?", "h2d", "HOLD", "PARK", "UNPARK", "d2h", "HC-TAKEN", "HI-RESET", "SKIP-TO-RESET", "OVERSLEEP-US" };
 	FILE *f = fopen(path, "w");
 	if (!f) return -1;
 	fprintf(f, "linked %d gen %u running %d mode %u pc %04x instrs %llu msgs %u epoch %02x\n",
@@ -817,14 +882,47 @@ static int trace_dump(const char *path)
 		fprintf(f, "  [%u] %-8s %06x epoch %02x\n", i, t < 9 ? hn[t] : "?", (unsigned)(m & 0xFFFFFF), (unsigned)(uint8_t)(m >> 48));
 	}
 	uint32_t n = trace_n < TRACE_N ? trace_n : TRACE_N;
+
+	// Main's disk requests and poll gaps that end inside the trace, by start time
+	static disk_ev dk[DISK_N];
+	uint32_t dall = __atomic_load_n(&disk_n, __ATOMIC_ACQUIRE), dc = 0;
+	uint32_t base = n ? trace_buf[(trace_n - n) % TRACE_N].us : 0;
+	for (uint32_t i = dall < DISK_N ? 0 : dall - DISK_N; i != dall; i++)
+	{
+		const disk_ev &d = disk_buf[i % DISK_N];
+		if ((int32_t)(d.t0 + d.dur - base) >= 0) dk[dc++] = d;
+	}
+	std::sort(dk, dk + dc, [base](const disk_ev &a, const disk_ev &b) { return (int32_t)(a.t0 - base) < (int32_t)(b.t0 - base); });
+	uint32_t slow = 0, gaps = 0;
+	for (uint32_t i = 0; i < dc; i++)
+	{
+		if (dk[i].op == DISK_GAP) gaps++;
+		else if (dk[i].dur >= DISK_SLOW_US) slow++;
+	}
+	fprintf(f, "\nMain's thread in the trace window: %u disk requests (%u >= %u us), %u poll gaps >= %u us\n",
+	        dc - gaps, slow, DISK_SLOW_US, gaps, DISK_GAP_US);
+
 	fprintf(f, "\nlast %u events (instrs, us, pc, event):\n", n);
+	uint32_t di = 0;
 	for (uint32_t k = trace_n - n; k != trace_n; k++)
 	{
 		const trace_ev &e = trace_buf[k % TRACE_N];
+		for (; di < dc && (int32_t)(dk[di].t0 - e.us) <= 0; di++)
+		{
+			const disk_ev &d = dk[di];
+			if (d.op == DISK_GAP)
+				fprintf(f, "%12s %10u %4s %-13s %u us\n", "", d.t0, "", "MAIN-POLL-GAP", d.dur);
+			else
+				fprintf(f, "%12s %10u %4s %-13s disk %u %s lba %u sz %u: %u us%s\n", "", d.t0, "", "DISK", d.disk,
+				        d.op == 2 ? "write" : "read", d.lba, d.sz, d.dur, d.dur >= DISK_SLOW_US ? "  SLOW" : "");
+		}
 		const char *tn = e.kind == EV_D2H ? (e.type < 7 ? dn[e.type] : "?") : (e.type < 9 ? hn[e.type] : "?");
-		if (e.kind == EV_HCTAKEN || e.kind == EV_HIRESET) tn = "";
-		fprintf(f, "%12llu %10u %04x %-13s %-8s %06x\n", (unsigned long long)e.instrs, e.us, e.pc,
-		        e.kind < 9 ? kn[e.kind] : "?", tn, e.data);
+		if (e.kind == EV_HCTAKEN || e.kind == EV_HIRESET || e.kind == EV_OVERSLEEP) tn = "";
+		if (e.kind == EV_OVERSLEEP)
+			fprintf(f, "%12llu %10u %04x %-13s %u us\n", (unsigned long long)e.instrs, e.us, e.pc, "DSP-OVERSLEEP", e.data);
+		else
+			fprintf(f, "%12llu %10u %04x %-13s %-8s %06x\n", (unsigned long long)e.instrs, e.us, e.pc,
+			        e.kind < 10 ? kn[e.kind] : "?", tn, e.data);
 	}
 	int r = ferror(f) ? -1 : 0;
 	fclose(f);
@@ -1052,6 +1150,14 @@ static void stats_poll(void)
 			fprintf(f, "\n");
 			memset(dsp_jit_ihist, 0, 65536 * 4);
 		}
+		uint32_t dr = __atomic_exchange_n(&st_disk_reqs, 0, __ATOMIC_RELAXED);
+		uint32_t dus = __atomic_exchange_n(&st_disk_us, 0, __ATOMIC_RELAXED);
+		fprintf(f, "      main: disk %u reqs (%u >= %u us, max %u us, busy %.1f%%), poll max gap %u us;  dsp oversleep max %u us (%u >= %u us);  host silence max %u us (%u >= %u us)\n",
+		        dr, __atomic_exchange_n(&st_disk_slow, 0, __ATOMIC_RELAXED), DISK_SLOW_US,
+		        __atomic_exchange_n(&st_disk_max, 0, __ATOMIC_RELAXED), 100.0 * dus * 1000.0 / dw,
+		        __atomic_exchange_n(&st_main_max, 0, __ATOMIC_RELAXED), st_oversleep_max, st_oversleeps, OVERSLEEP_US,
+		        st_host_gap_max, st_host_gaps, HOST_GAP_US);
+		st_oversleep_max = 0; st_oversleeps = 0; st_host_gap_max = 0; st_host_gaps = 0;
 		fclose(f);
 	}
 	if (armed && !dsp_jit_ihist) dsp_jit_ihist = (uint32_t *)calloc(65536, 4);
@@ -1120,6 +1226,10 @@ static void *dsp_thread(void *)
 			while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
 			if (prof_on) prof_sleep += due - t;
 			st_sleep_ns += due - t;
+			uint64_t woke = now_ns();
+			uint32_t over = woke > due ? (uint32_t)((woke - due) / 1000) : 0;
+			if (over >= OVERSLEEP_US) { trace(EV_OVERSLEEP, 0, over); st_oversleeps++; }
+			if (over > st_oversleep_max) st_oversleep_max = over;
 		}
 		else if (t > due + 50000000ull)
 		{
